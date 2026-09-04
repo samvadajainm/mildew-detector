@@ -5,101 +5,284 @@
 <title>Mildew Detector</title>
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 <style>
-  body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 40px auto; text-align: center; padding: 0 16px; }
-  h2 { margin-bottom: 4px; }
-  #status { color: #666; margin-top: 8px; min-height: 20px; }
-  canvas { border: 1px solid #ccc; margin-top: 16px; max-width: 100%; image-rendering: pixelated; }
-  #result { margin-top: 20px; font-size: 22px; font-weight: bold; min-height: 30px; }
-  .healthy { color: #2E7D32; }
-  .infected { color: #B71C1C; }
-  input[type=file] { margin-top: 20px; font-size: 16px; }
+  :root {
+    --forest: #1F3D37;
+    --forest-hover: #2D2743;
+    --mint-bg: #EAF3EC;
+    --mint-border: #A9C9B3;
+    --page-bg: #FFFFFF;
+    --healthy: #2E7D32;
+    --infected: #B71C1C;
+    --gray-disabled: #D9D6CC;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--page-bg);
+    margin: 0;
+    padding: 40px 16px;
+  }
+  .card {
+    max-width: 460px;
+    margin: 0 auto;
+  }
+  h2 {
+    color: #1a1a1a;
+    text-align: center;
+    font-size: 26px;
+    margin: 0 0 6px;
+  }
+  #subtitle {
+    text-align: center;
+    color: #555;
+    margin: 0 0 20px;
+    font-size: 15px;
+  }
+  #status {
+    text-align: center;
+    color: #888;
+    margin-bottom: 14px;
+    min-height: 16px;
+    font-size: 13px;
+  }
+
+  /* Drop zone */
+  #dropZone {
+    border: 2px dashed var(--mint-border);
+    border-radius: 14px;
+    background: var(--mint-bg);
+    padding: 40px 24px;
+    text-align: center;
+  }
+  #dropZone.dragover { border-color: var(--forest); }
+  #dropZone svg { display: block; margin: 0 auto 18px; }
+
+  #selectBtn {
+    background: var(--forest);
+    color: white;
+    border: none;
+    padding: 12px 28px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #selectBtn:hover { background: var(--forest-hover); }
+
+  #dropZoneSub {
+    color: #6b6b6b;
+    font-size: 13px;
+    margin-top: 14px;
+  }
+  #fileInput { display: none; }
+
+  /* Preview state (after a file is chosen) */
+  #previewWrap { display: none; }
+  #previewImg {
+    max-width: 100%;
+    max-height: 240px;
+    border-radius: 8px;
+    display: block;
+    margin: 0 auto 14px;
+  }
+  #changeImageBtn {
+    background: none;
+    border: 1px solid var(--mint-border);
+    color: var(--forest);
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #changeImageBtn:hover { background: #DDEBE1; }
+
+  #procCanvas { display: none; }
+
+  /* Bottom action button */
+  #analyzeBtn {
+    width: 100%;
+    margin-top: 18px;
+    background: var(--gray-disabled);
+    color: #9c988c;
+    border: none;
+    padding: 15px;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: default;
+    transition: background 0.15s, color 0.15s;
+    box-sizing: border-box;
+  }
+  #analyzeBtn.active {
+    background: var(--forest);
+    color: white;
+    cursor: pointer;
+  }
+  #analyzeBtn.active:hover { background: var(--forest-hover); }
+
+  /* Result card */
+  #result {
+    display: none;
+    margin-top: 20px;
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+  }
+  #result.healthy { background: #E9F5EA; border: 1px solid var(--healthy); }
+  #result.infected { background: #FBEAEA; border: 1px solid var(--infected); }
+  #resultLabel { font-size: 21px; font-weight: 700; }
+  #result.healthy #resultLabel { color: var(--healthy); }
+  #result.infected #resultLabel { color: var(--infected); }
+  #resultRating { margin-top: 6px; font-size: 14px; color: #555; }
+  #resultRating b { font-size: 16px; color: #222; }
 </style>
 </head>
 <body>
+<div class="card">
   <h2>Mildew Detector</h2>
+  <p id="subtitle">Upload one image to check a plant for powdery mildew.</p>
   <div id="status">Loading model…</div>
-  <input id="imageInput" type="file" accept="image/*" disabled>
-  <canvas id="preview" width="224" height="224" style="display:none;"></canvas>
-  <div id="result"></div>
+
+  <div id="dropZone">
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#7A9184" stroke-width="1.5">
+      <rect x="3" y="3" width="18" height="18" rx="3"/>
+      <circle cx="8.5" cy="8.5" r="1.5"/>
+      <path d="M21 15l-5-5L5 21"/>
+    </svg>
+
+    <button id="selectBtn" type="button">Select Image</button>
+    <div id="dropZoneSub">Accepted: JPG, JPEG, PNG. One image at a time.</div>
+
+    <div id="previewWrap">
+      <img id="previewImg" alt="Selected leaf">
+      <button id="changeImageBtn" type="button">Choose a different photo</button>
+    </div>
+  </div>
+  <input id="fileInput" type="file" accept="image/*" disabled>
+
+  <canvas id="procCanvas" width="224" height="224"></canvas>
+
+  <button id="analyzeBtn" disabled>Analyze Photo</button>
+
+  <div id="result">
+    <div id="resultLabel"></div>
+    <div id="resultRating"></div>
+  </div>
+</div>
 
   <script>
-    // ── Model config — matches mildew_detector.tflite / mildew_detector.onnx exactly ──
-    const MODEL_URL   = 'mildew_detector.onnx'; // host this file alongside the page
+    const MODEL_URL   = 'mildew_detector.onnx';
     const INPUT_NAME  = 'serving_default_image_input:0';
     const OUTPUT_NAME = 'StatefulPartitionedCall_1:0';
     const INPUT_SIZE  = 224;
-    const THRESHOLD   = 0.50; // matches CONF_THRESHOLD in TFLiteInferencer.kt
+    const RATING_THRESHOLD = 4; // rating > 4 => Infected
 
     let session;
+    let selectedFile = null;
+
+    const dropZone     = document.getElementById('dropZone');
+    const selectBtn    = document.getElementById('selectBtn');
+    const dropZoneSub  = document.getElementById('dropZoneSub');
+    const previewWrap  = document.getElementById('previewWrap');
+    const previewImg   = document.getElementById('previewImg');
+    const changeBtn    = document.getElementById('changeImageBtn');
+    const fileInput    = document.getElementById('fileInput');
+    const analyzeBtn   = document.getElementById('analyzeBtn');
+    const status       = document.getElementById('status');
+    const result       = document.getElementById('result');
+    const resultLabel  = document.getElementById('resultLabel');
+    const resultRating = document.getElementById('resultRating');
+    const canvas       = document.getElementById('procCanvas');
+    const ctx           = canvas.getContext('2d');
 
     async function main() {
-      const input  = document.getElementById('imageInput');
-      const status = document.getElementById('status');
-      const result = document.getElementById('result');
-      const canvas = document.getElementById('preview');
-      const ctx    = canvas.getContext('2d');
-
       try {
         session = await ort.InferenceSession.create(MODEL_URL);
-        status.innerText = 'Model ready — upload a leaf photo';
-        input.disabled = false;
+        status.innerText = 'Model ready';
+        fileInput.disabled = false;
       } catch (err) {
         console.error(err);
         status.innerText = 'Failed to load model. Check that mildew_detector.onnx is hosted alongside this page.';
-        return;
       }
+    }
 
-      input.addEventListener('change', async function () {
-        if (!this.files[0]) return;
-        input.disabled = true;
-        result.innerHTML = '';
-        status.innerText = 'Running inference…';
+    selectBtn.addEventListener('click', () => fileInput.click());
+    changeBtn.addEventListener('click', () => fileInput.click());
 
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropZone.classList.add('dragover');
+    });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('dragover');
+      if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+    });
+
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files[0]) handleFile(fileInput.files[0]);
+    });
+
+    function handleFile(file) {
+      selectedFile = file;
+      previewImg.src = URL.createObjectURL(file);
+
+      dropZone.querySelector('svg').style.display = 'none';
+      selectBtn.style.display = 'none';
+      dropZoneSub.style.display = 'none';
+      previewWrap.style.display = 'block';
+
+      analyzeBtn.disabled = false;
+      analyzeBtn.classList.add('active');
+      result.style.display = 'none';
+    }
+
+    analyzeBtn.addEventListener('click', async () => {
+      if (!selectedFile || !session || !analyzeBtn.classList.contains('active')) return;
+      analyzeBtn.disabled = true;
+      analyzeBtn.classList.remove('active');
+      analyzeBtn.innerText = 'Analyzing…';
+      result.style.display = 'none';
+
+      try {
         const img = new Image();
-        img.src = URL.createObjectURL(this.files[0]);
-        await new Promise(res => (img.onload = res));
+        img.src = URL.createObjectURL(selectedFile);
+        await new Promise((res) => (img.onload = res));
 
-        // Resize to 224x224 — bilinear, same as Bitmap.createScaledBitmap(..., true) in Android
-        canvas.style.display = 'inline-block';
         ctx.drawImage(img, 0, 0, INPUT_SIZE, INPUT_SIZE);
-
         const imageData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
 
-        // Build NHWC float32 tensor, RAW 0-255 values, NO normalization.
-        // Mirrors TFLiteInferencer.kt exactly:
-        //   putFloat(Color.red(px))   // NO division
-        //   putFloat(Color.green(px)) // NO division
-        //   putFloat(Color.blue(px))  // NO division
+        // NHWC float32, raw 0-255 values, no normalization — matches Android TFLiteInferencer.kt
         const floatData = new Float32Array(INPUT_SIZE * INPUT_SIZE * 3);
         for (let i = 0, j = 0; i < imageData.length; i += 4, j += 3) {
-          floatData[j]     = imageData[i];     // R
-          floatData[j + 1] = imageData[i + 1]; // G
-          floatData[j + 2] = imageData[i + 2]; // B
-          // alpha (imageData[i+3]) is dropped — model has no alpha channel
+          floatData[j]     = imageData[i];
+          floatData[j + 1] = imageData[i + 1];
+          floatData[j + 2] = imageData[i + 2];
         }
 
         const tensor = new ort.Tensor('float32', floatData, [1, INPUT_SIZE, INPUT_SIZE, 3]);
         const feeds = {};
         feeds[INPUT_NAME] = tensor;
 
-        try {
-          const output = await session.run(feeds);
-          const score = output[OUTPUT_NAME].data[0]; // 0 = healthy, 1 = infected
-          const isInfected = score >= THRESHOLD;
-          const healthScore = Math.round(score * 100);
+        const output = await session.run(feeds);
+        const score = output[OUTPUT_NAME].data[0];
+        const rating = Math.round(score * 10 * 10) / 10;
+        const isInfected = rating > RATING_THRESHOLD;
 
-          result.innerHTML = isInfected
-            ? `<span class="infected">Infected — ${healthScore}% confidence</span>`
-            : `<span class="healthy">Healthy — ${100 - healthScore}% confidence</span>`;
-          status.innerText = 'Done';
-        } catch (err) {
-          console.error(err);
-          status.innerText = 'Inference failed — see console for details';
-        }
+        result.className = isInfected ? 'infected' : 'healthy';
+        resultLabel.innerText = isInfected ? 'Infected' : 'Healthy';
+        resultRating.innerHTML = `Rating: <b>${rating.toFixed(1)} / 10</b>`;
+        result.style.display = 'block';
+        status.innerText = 'Done';
+      } catch (err) {
+        console.error(err);
+        status.innerText = 'Analysis failed — see console for details';
+      }
 
-        input.disabled = false;
-      });
-    }
+      analyzeBtn.disabled = false;
+      analyzeBtn.classList.add('active');
+      analyzeBtn.innerText = 'Analyze Photo';
+    });
 
     main();
   </script>
