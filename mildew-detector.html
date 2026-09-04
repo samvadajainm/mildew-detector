@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Mildew Detector</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 40px auto; text-align: center; padding: 0 16px; }
+  h2 { margin-bottom: 4px; }
+  #status { color: #666; margin-top: 8px; min-height: 20px; }
+  canvas { border: 1px solid #ccc; margin-top: 16px; max-width: 100%; image-rendering: pixelated; }
+  #result { margin-top: 20px; font-size: 22px; font-weight: bold; min-height: 30px; }
+  .healthy { color: #2E7D32; }
+  .infected { color: #B71C1C; }
+  input[type=file] { margin-top: 20px; font-size: 16px; }
+</style>
+</head>
+<body>
+  <h2>Mildew Detector</h2>
+  <div id="status">Loading model…</div>
+  <input id="imageInput" type="file" accept="image/*" disabled>
+  <canvas id="preview" width="224" height="224" style="display:none;"></canvas>
+  <div id="result"></div>
+
+  <script>
+    // ── Model config — matches mildew_detector.tflite / mildew_detector.onnx exactly ──
+    const MODEL_URL   = 'mildew_detector.onnx'; // host this file alongside the page
+    const INPUT_NAME  = 'serving_default_image_input:0';
+    const OUTPUT_NAME = 'StatefulPartitionedCall_1:0';
+    const INPUT_SIZE  = 224;
+    const THRESHOLD   = 0.50; // matches CONF_THRESHOLD in TFLiteInferencer.kt
+
+    let session;
+
+    async function main() {
+      const input  = document.getElementById('imageInput');
+      const status = document.getElementById('status');
+      const result = document.getElementById('result');
+      const canvas = document.getElementById('preview');
+      const ctx    = canvas.getContext('2d');
+
+      try {
+        session = await ort.InferenceSession.create(MODEL_URL);
+        status.innerText = 'Model ready — upload a leaf photo';
+        input.disabled = false;
+      } catch (err) {
+        console.error(err);
+        status.innerText = 'Failed to load model. Check that mildew_detector.onnx is hosted alongside this page.';
+        return;
+      }
+
+      input.addEventListener('change', async function () {
+        if (!this.files[0]) return;
+        input.disabled = true;
+        result.innerHTML = '';
+        status.innerText = 'Running inference…';
+
+        const img = new Image();
+        img.src = URL.createObjectURL(this.files[0]);
+        await new Promise(res => (img.onload = res));
+
+        // Resize to 224x224 — bilinear, same as Bitmap.createScaledBitmap(..., true) in Android
+        canvas.style.display = 'inline-block';
+        ctx.drawImage(img, 0, 0, INPUT_SIZE, INPUT_SIZE);
+
+        const imageData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+
+        // Build NHWC float32 tensor, RAW 0-255 values, NO normalization.
+        // Mirrors TFLiteInferencer.kt exactly:
+        //   putFloat(Color.red(px))   // NO division
+        //   putFloat(Color.green(px)) // NO division
+        //   putFloat(Color.blue(px))  // NO division
+        const floatData = new Float32Array(INPUT_SIZE * INPUT_SIZE * 3);
+        for (let i = 0, j = 0; i < imageData.length; i += 4, j += 3) {
+          floatData[j]     = imageData[i];     // R
+          floatData[j + 1] = imageData[i + 1]; // G
+          floatData[j + 2] = imageData[i + 2]; // B
+          // alpha (imageData[i+3]) is dropped — model has no alpha channel
+        }
+
+        const tensor = new ort.Tensor('float32', floatData, [1, INPUT_SIZE, INPUT_SIZE, 3]);
+        const feeds = {};
+        feeds[INPUT_NAME] = tensor;
+
+        try {
+          const output = await session.run(feeds);
+          const score = output[OUTPUT_NAME].data[0]; // 0 = healthy, 1 = infected
+          const isInfected = score >= THRESHOLD;
+          const healthScore = Math.round(score * 100);
+
+          result.innerHTML = isInfected
+            ? `<span class="infected">Infected — ${healthScore}% confidence</span>`
+            : `<span class="healthy">Healthy — ${100 - healthScore}% confidence</span>`;
+          status.innerText = 'Done';
+        } catch (err) {
+          console.error(err);
+          status.innerText = 'Inference failed — see console for details';
+        }
+
+        input.disabled = false;
+      });
+    }
+
+    main();
+  </script>
+</body>
+</html>
