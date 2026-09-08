@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watermelon Leaf Mildew Scorer</title>
+<style>
+  :root {
+    --bg: #1c1f1a;
+    --panel: #262a22;
+    --ink: #eef0e6;
+    --muted: #9aa08c;
+    --accent: #7fb069;
+    --diseased: #d9694f;
+    --border: #3a3f33;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 32px 20px 60px;
+  }
+  main { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; font-weight: 600; margin: 0 0 6px; }
+  p.lede { color: var(--muted); margin: 0 0 28px; max-width: 60ch; line-height: 1.5; }
+  .drop {
+    display: block;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    padding: 28px;
+    text-align: center;
+    cursor: pointer;
+    background: var(--panel);
+  }
+  .drop:hover { border-color: var(--accent); }
+  input[type=file] { display: none; }
+  .panels {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+    margin-top: 28px;
+  }
+  .panel { background: var(--panel); border-radius: 8px; padding: 8px; }
+  .panel canvas { width: 100%; border-radius: 4px; display: block; background: #000; }
+  .panel .label { font-size: 0.7rem; letter-spacing: .03em; color: var(--muted); margin-top: 6px; }
+  .result {
+    margin-top: 24px;
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 20px 22px;
+  }
+  .verdict { font-size: 1.3rem; font-weight: 600; }
+  .verdict.diseased { color: var(--diseased); }
+  .verdict.healthy { color: var(--accent); }
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 14px;
+    margin-top: 16px;
+    font-variant-numeric: tabular-nums;
+  }
+  .metric .n { font-size: 1.15rem; }
+  .metric .l { font-size: 0.75rem; color: var(--muted); }
+  .warnings {
+    margin-top: 16px;
+    padding: 12px 14px;
+    background: #3a2c20;
+    border-radius: 8px;
+    color: #e8c48a;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  .status { color: var(--muted); font-size: 0.85rem; margin-top: 10px; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Watermelon Leaf Mildew Scorer</h1>
+  <p class="lede">
+    Photograph a single flat leaf on a plain dark backdrop, lit evenly, from directly overhead.
+    Everything runs in your browser — no image is uploaded anywhere.
+  </p>
+
+  <label class="drop" id="drop">
+    <div id="dropLabel">Click to choose a leaf photo, or drag one here</div>
+    <input type="file" id="file" accept="image/*">
+  </label>
+
+  <div id="status" class="status"></div>
+
+  <div class="panels" id="panels" hidden>
+    <div class="panel"><canvas id="cRaw"></canvas><div class="label">RAW</div></div>
+    <div class="panel"><canvas id="cNorm"></canvas><div class="label">EXPOSURE-NORMALISED</div></div>
+    <div class="panel"><canvas id="cSeg"></canvas><div class="label">SEGMENTATION</div></div>
+    <div class="panel"><canvas id="cTissue"></canvas><div class="label">TISSUE MAP</div></div>
+    <div class="panel"><canvas id="cBloom"></canvas><div class="label">BLOOM ONLY</div></div>
+  </div>
+
+  <div class="result" id="result" hidden>
+    <div class="verdict" id="verdict"></div>
+    <div class="metrics">
+      <div class="metric"><div class="n" id="mConfidence"></div><div class="l">confidence</div></div>
+      <div class="metric"><div class="n" id="mSeverity"></div><div class="l">est. severity /10</div></div>
+      <div class="metric"><div class="n" id="mHealthy"></div><div class="l">healthy tissue</div></div>
+      <div class="metric"><div class="n" id="mChlorotic"></div><div class="l">chlorotic tissue</div></div>
+      <div class="metric"><div class="n" id="mBloom"></div><div class="l">bloom/patchy tissue</div></div>
+    </div>
+    <div class="warnings" id="warnings" hidden></div>
+  </div>
+</main>
+
+<script src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+<script type="module">
+  import { LeafScorer, overlay, disposeResult } from './js/score.js';
+
+  const statusEl = document.getElementById('status');
+  const dropLabel = document.getElementById('dropLabel');
+  const fileInput = document.getElementById('file');
+  const dropZone = document.getElementById('drop');
+  const panelsEl = document.getElementById('panels');
+  const resultEl = document.getElementById('result');
+
+  let scorer = null;
+  let cvReady = false;
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+  function maybeReady() { if (cvReady && scorer) setStatus('Ready.'); }
+
+  setStatus('Loading model…');
+  cv['onRuntimeInitialized'] = () => { cvReady = true; maybeReady(); };
+  LeafScorer.load('model_v2.json').then(s => { scorer = s; maybeReady(); })
+    .catch(e => setStatus('Could not load model_v2.json: ' + e.message));
+
+  dropZone.addEventListener('dragover', e => e.preventDefault());
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (f) runOn(f);
+  });
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) runOn(fileInput.files[0]);
+  });
+
+  function drawMatToCanvas(mat, canvas) {
+    let show = mat, tmp = null;
+    if (mat.channels() === 3) { tmp = new cv.Mat(); cv.cvtColor(mat, tmp, cv.COLOR_RGB2RGBA); show = tmp; }
+    cv.imshow(canvas, show);
+    if (tmp) tmp.delete();
+  }
+
+  function loadImage(file) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  async function runOn(file) {
+    if (!scorer || !cvReady) { setStatus('Still loading — try again in a moment.'); return; }
+    setStatus('Scoring…');
+    dropLabel.textContent = file.name;
+
+    const img = await loadImage(file);
+    const rawCanvas = document.getElementById('cRaw');
+    rawCanvas.width = img.width;
+    rawCanvas.height = img.height;
+    rawCanvas.getContext('2d').drawImage(img, 0, 0);
+
+    const rgba = cv.imread(rawCanvas);
+    const result = scorer.score(rgba);
+
+    if (!result.ok) {
+      setStatus(result.detail || result.error);
+      panelsEl.hidden = true;
+      resultEl.hidden = true;
+      rgba.delete();
+      return;
+    }
+
+    const { mask, normalised, tissue } = result._debug;
+
+    drawMatToCanvas(normalised, document.getElementById('cNorm'));
+
+    const segView = normalised.clone();
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    cv.drawContours(segView, contours, -1, new cv.Scalar(255, 0, 255), 2);
+    contours.delete(); hierarchy.delete();
+    drawMatToCanvas(segView, document.getElementById('cSeg'));
+    segView.delete();
+
+    const tissueView = overlay(rgba, result, 1.0);
+    drawMatToCanvas(tissueView, document.getElementById('cTissue'));
+    tissueView.delete();
+
+    const bloomView = normalised.clone();
+    const bData = tissue.bloom.data, bvData = bloomView.data;
+    for (let i = 0; i < tissue.bloom.rows * tissue.bloom.cols; i++) {
+      if (bData[i]) { bvData[i * 3] = 255; bvData[i * 3 + 1] = 0; bvData[i * 3 + 2] = 255; }
+    }
+    drawMatToCanvas(bloomView, document.getElementById('cBloom'));
+    bloomView.delete();
+
+    panelsEl.hidden = false;
+
+    const verdictEl = document.getElementById('verdict');
+    verdictEl.textContent = `${result.verdict}  (p=${result.p_diseased.toFixed(2)})`;
+    verdictEl.className = 'verdict ' + (result.verdict === 'DISEASED' ? 'diseased' : 'healthy');
+    document.getElementById('mConfidence').textContent = (result.confidence * 100).toFixed(0) + '%';
+    document.getElementById('mSeverity').textContent = result.severity_0_10.toFixed(1);
+    document.getElementById('mHealthy').textContent = result.tissue.healthy_pct.toFixed(1) + '%';
+    document.getElementById('mChlorotic').textContent = result.tissue.chlorotic_pct.toFixed(1) + '%';
+    document.getElementById('mBloom').textContent = result.tissue.bloom_pct.toFixed(1) + '%';
+
+    const warnEl = document.getElementById('warnings');
+    if (result.quality.warnings.length) {
+      warnEl.hidden = false;
+      warnEl.textContent = '⚠ ' + result.quality.warnings.join('  •  ');
+    } else {
+      warnEl.hidden = true;
+    }
+    resultEl.hidden = false;
+
+    setStatus('Done.');
+    disposeResult(result);
+    rgba.delete();
+  }
+</script>
+</body>
+</html>
