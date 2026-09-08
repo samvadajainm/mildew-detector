@@ -73,6 +73,31 @@
     line-height: 1.5;
   }
   .status { color: var(--muted); font-size: 0.85rem; margin-top: 10px; min-height: 1.2em; }
+  .analyze-btn {
+    display: block;
+    margin-top: 14px;
+    padding: 10px 18px;
+    background: var(--accent);
+    color: #14170f;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .analyze-btn:hover { filter: brightness(1.08); }
+  .analyze-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .error-box {
+    margin-top: 10px;
+    padding: 12px 14px;
+    background: #3a2020;
+    border-radius: 8px;
+    color: #f0a8a0;
+    font-size: 0.8rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
 </style>
 </head>
 <body>
@@ -88,7 +113,10 @@
     <input type="file" id="file" accept="image/*">
   </label>
 
+  <button id="analyzeBtn" class="analyze-btn" hidden>Analyze photo</button>
+
   <div id="status" class="status"></div>
+  <div id="errorBox" class="error-box" hidden></div>
 
   <div class="panels" id="panels" hidden>
     <div class="panel"><canvas id="cRaw"></canvas><div class="label">RAW</div></div>
@@ -116,32 +144,86 @@
   import { LeafScorer, overlay, disposeResult } from './js/score.js';
 
   const statusEl = document.getElementById('status');
+  const errorBox = document.getElementById('errorBox');
   const dropLabel = document.getElementById('dropLabel');
   const fileInput = document.getElementById('file');
   const dropZone = document.getElementById('drop');
+  const analyzeBtn = document.getElementById('analyzeBtn');
   const panelsEl = document.getElementById('panels');
   const resultEl = document.getElementById('result');
 
   let scorer = null;
   let cvReady = false;
+  let cvLoadFailed = false;
+  let currentFile = null;
 
   function setStatus(msg) { statusEl.textContent = msg; }
-  function maybeReady() { if (cvReady && scorer) setStatus('Ready.'); }
+  function showError(msg) { errorBox.hidden = false; errorBox.textContent = msg; }
+  function clearError() { errorBox.hidden = true; errorBox.textContent = ''; }
+  function maybeReady() {
+    if (cvReady && scorer) setStatus('Ready — choose a photo to begin.');
+  }
 
-  setStatus('Loading model…');
-  cv['onRuntimeInitialized'] = () => { cvReady = true; maybeReady(); };
+  setStatus('Loading OpenCV.js and model…');
+
+  // If opencv.js itself failed to load (CDN blocked, offline, etc.) 'cv'
+  // never gets defined, so onRuntimeInitialized is never reached — catch
+  // that case instead of hanging on "Loading…" forever.
+  setTimeout(() => {
+    if (!cvReady) {
+      cvLoadFailed = true;
+      setStatus('OpenCV.js has not finished loading. If this persists, check your network/ad-blocker — the widget loads it from docs.opencv.org.');
+    }
+  }, 15000);
+
+  if (typeof cv !== 'undefined') {
+    cv['onRuntimeInitialized'] = () => { cvReady = true; maybeReady(); };
+  } else {
+    // opencv.js hasn't executed yet; poll briefly for the global to appear.
+    const poll = setInterval(() => {
+      if (typeof cv !== 'undefined') {
+        clearInterval(poll);
+        cv['onRuntimeInitialized'] = () => { cvReady = true; maybeReady(); };
+      }
+    }, 100);
+  }
+
   LeafScorer.load('model_v2.json').then(s => { scorer = s; maybeReady(); })
-    .catch(e => setStatus('Could not load model_v2.json: ' + e.message));
+    .catch(e => { showError('Could not load model_v2.json: ' + e.message); setStatus('Setup failed.'); });
 
   dropZone.addEventListener('dragover', e => e.preventDefault());
   dropZone.addEventListener('drop', e => {
     e.preventDefault();
     const f = e.dataTransfer.files[0];
-    if (f) runOn(f);
+    if (f) previewFile(f);
   });
   fileInput.addEventListener('change', () => {
-    if (fileInput.files[0]) runOn(fileInput.files[0]);
+    if (fileInput.files[0]) previewFile(fileInput.files[0]);
   });
+  analyzeBtn.addEventListener('click', () => { if (currentFile) runOn(currentFile); });
+
+  async function previewFile(file) {
+    currentFile = file;
+    clearError();
+    dropLabel.textContent = file.name;
+
+    const img = await loadImage(file);
+    const rawCanvas = document.getElementById('cRaw');
+    rawCanvas.width = img.width;
+    rawCanvas.height = img.height;
+    rawCanvas.getContext('2d').drawImage(img, 0, 0);
+
+    // Show the raw preview right away, independent of whether scoring
+    // succeeds — so a pipeline error later doesn't leave you seeing nothing.
+    panelsEl.hidden = false;
+    resultEl.hidden = true;
+
+    analyzeBtn.hidden = false;
+    analyzeBtn.disabled = !(cvReady && scorer);
+    setStatus(analyzeBtn.disabled
+      ? (cvLoadFailed ? 'OpenCV.js failed to load — see message above.' : 'Photo loaded — still finishing setup, one moment…')
+      : 'Photo loaded. Click "Analyze photo" to score it.');
+  }
 
   function drawMatToCanvas(mat, canvas) {
     let show = mat, tmp = null;
@@ -161,74 +243,77 @@
 
   async function runOn(file) {
     if (!scorer || !cvReady) { setStatus('Still loading — try again in a moment.'); return; }
+    clearError();
     setStatus('Scoring…');
-    dropLabel.textContent = file.name;
+    analyzeBtn.disabled = true;
 
-    const img = await loadImage(file);
     const rawCanvas = document.getElementById('cRaw');
-    rawCanvas.width = img.width;
-    rawCanvas.height = img.height;
-    rawCanvas.getContext('2d').drawImage(img, 0, 0);
+    let rgba = null;
+    let result = null;
 
-    const rgba = cv.imread(rawCanvas);
-    const result = scorer.score(rgba);
+    try {
+      rgba = cv.imread(rawCanvas);
+      result = scorer.score(rgba);
 
-    if (!result.ok) {
-      setStatus(result.detail || result.error);
-      panelsEl.hidden = true;
+      if (!result.ok) {
+        setStatus(result.detail || result.error);
+        resultEl.hidden = true;
+        return;
+      }
+
+      const { mask, normalised, tissue } = result._debug;
+
+      drawMatToCanvas(normalised, document.getElementById('cNorm'));
+
+      const segView = normalised.clone();
+      const contours = new cv.MatVector();
+      const hierarchy = new cv.Mat();
+      cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      cv.drawContours(segView, contours, -1, new cv.Scalar(255, 0, 255), 2);
+      contours.delete(); hierarchy.delete();
+      drawMatToCanvas(segView, document.getElementById('cSeg'));
+      segView.delete();
+
+      const tissueView = overlay(rgba, result, 1.0);
+      drawMatToCanvas(tissueView, document.getElementById('cTissue'));
+      tissueView.delete();
+
+      const bloomView = normalised.clone();
+      const bData = tissue.bloom.data, bvData = bloomView.data;
+      for (let i = 0; i < tissue.bloom.rows * tissue.bloom.cols; i++) {
+        if (bData[i]) { bvData[i * 3] = 255; bvData[i * 3 + 1] = 0; bvData[i * 3 + 2] = 255; }
+      }
+      drawMatToCanvas(bloomView, document.getElementById('cBloom'));
+      bloomView.delete();
+
+      const verdictEl = document.getElementById('verdict');
+      verdictEl.textContent = `${result.verdict}  (p=${result.p_diseased.toFixed(2)})`;
+      verdictEl.className = 'verdict ' + (result.verdict === 'DISEASED' ? 'diseased' : 'healthy');
+      document.getElementById('mConfidence').textContent = (result.confidence * 100).toFixed(0) + '%';
+      document.getElementById('mSeverity').textContent = result.severity_0_10.toFixed(1);
+      document.getElementById('mHealthy').textContent = result.tissue.healthy_pct.toFixed(1) + '%';
+      document.getElementById('mChlorotic').textContent = result.tissue.chlorotic_pct.toFixed(1) + '%';
+      document.getElementById('mBloom').textContent = result.tissue.bloom_pct.toFixed(1) + '%';
+
+      const warnEl = document.getElementById('warnings');
+      if (result.quality.warnings.length) {
+        warnEl.hidden = false;
+        warnEl.textContent = '⚠ ' + result.quality.warnings.join('  •  ');
+      } else {
+        warnEl.hidden = true;
+      }
+      resultEl.hidden = false;
+      setStatus('Done.');
+    } catch (e) {
+      console.error(e);
+      setStatus('Something went wrong while scoring this photo.');
+      showError((e && e.message) ? e.message : String(e));
       resultEl.hidden = true;
-      rgba.delete();
-      return;
+    } finally {
+      if (result) disposeResult(result);
+      if (rgba) rgba.delete();
+      analyzeBtn.disabled = false;
     }
-
-    const { mask, normalised, tissue } = result._debug;
-
-    drawMatToCanvas(normalised, document.getElementById('cNorm'));
-
-    const segView = normalised.clone();
-    const contours = new cv.MatVector();
-    const hierarchy = new cv.Mat();
-    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    cv.drawContours(segView, contours, -1, new cv.Scalar(255, 0, 255), 2);
-    contours.delete(); hierarchy.delete();
-    drawMatToCanvas(segView, document.getElementById('cSeg'));
-    segView.delete();
-
-    const tissueView = overlay(rgba, result, 1.0);
-    drawMatToCanvas(tissueView, document.getElementById('cTissue'));
-    tissueView.delete();
-
-    const bloomView = normalised.clone();
-    const bData = tissue.bloom.data, bvData = bloomView.data;
-    for (let i = 0; i < tissue.bloom.rows * tissue.bloom.cols; i++) {
-      if (bData[i]) { bvData[i * 3] = 255; bvData[i * 3 + 1] = 0; bvData[i * 3 + 2] = 255; }
-    }
-    drawMatToCanvas(bloomView, document.getElementById('cBloom'));
-    bloomView.delete();
-
-    panelsEl.hidden = false;
-
-    const verdictEl = document.getElementById('verdict');
-    verdictEl.textContent = `${result.verdict}  (p=${result.p_diseased.toFixed(2)})`;
-    verdictEl.className = 'verdict ' + (result.verdict === 'DISEASED' ? 'diseased' : 'healthy');
-    document.getElementById('mConfidence').textContent = (result.confidence * 100).toFixed(0) + '%';
-    document.getElementById('mSeverity').textContent = result.severity_0_10.toFixed(1);
-    document.getElementById('mHealthy').textContent = result.tissue.healthy_pct.toFixed(1) + '%';
-    document.getElementById('mChlorotic').textContent = result.tissue.chlorotic_pct.toFixed(1) + '%';
-    document.getElementById('mBloom').textContent = result.tissue.bloom_pct.toFixed(1) + '%';
-
-    const warnEl = document.getElementById('warnings');
-    if (result.quality.warnings.length) {
-      warnEl.hidden = false;
-      warnEl.textContent = '⚠ ' + result.quality.warnings.join('  •  ');
-    } else {
-      warnEl.hidden = true;
-    }
-    resultEl.hidden = false;
-
-    setStatus('Done.');
-    disposeResult(result);
-    rgba.delete();
   }
 </script>
 </body>
