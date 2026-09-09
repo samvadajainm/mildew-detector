@@ -265,20 +265,35 @@
       warnings.style.display = 'none';
       setStatus('Running inference…');
 
-      const img = new Image();
-      img.onload = () => {
+      // Read the file as raw bytes and decode with OpenCV's imdecode —
+      // this matches Python's cv2.imread EXACTLY (no ICC profile, no browser
+      // color management). Going through canvas + ctx.drawImage applies the
+      // JPEG's embedded ICC profile, which systematically shifts pixel values
+      // and was causing a 9-point saturation gap vs Python.
+      selectedFile.arrayBuffer().then(function (arrayBuffer) {
         try {
-          let w = img.naturalWidth, h = img.naturalHeight;
-          if (Math.max(w, h) > MAX_SIDE) {
-            const scale = MAX_SIDE / Math.max(w, h);
-            w = Math.round(w * scale);
-            h = Math.round(h * scale);
-          }
-          canvas.width = w;
-          canvas.height = h;
-          ctx.drawImage(img, 0, 0, w, h);
+          const uint8 = new Uint8Array(arrayBuffer);
+          const rawMat = new cv.Mat(uint8.length, 1, cv.CV_8UC1);
+          rawMat.data.set(uint8);
+          const bgr = cv.imdecode(rawMat, cv.IMREAD_COLOR);
+          rawMat.delete();
 
-          const rgba = cv.imread(canvas);
+          if (!bgr || bgr.empty()) {
+            setStatus('OpenCV could not decode the image file', true);
+            analyzeBtn.disabled = false;
+            analyzeBtn.classList.add('active');
+            analyzeBtn.innerText = 'Analyze Photo';
+            return;
+          }
+
+          log('imdecode OK: ' + bgr.cols + 'x' + bgr.rows + ' channels=' + bgr.channels());
+
+          // Convert BGR (imdecode's output, matching cv2.imread) → RGBA
+          // so scorer.score() sees the same format as before
+          const rgba = new cv.Mat();
+          cv.cvtColor(bgr, rgba, cv.COLOR_BGR2RGBA);
+          bgr.delete();
+
           const r = scorer.score(rgba);
           rgba.delete();
 
@@ -326,14 +341,13 @@
         analyzeBtn.disabled = false;
         analyzeBtn.classList.add('active');
         analyzeBtn.innerText = 'Analyze Photo';
-      };
-      img.onerror = () => {
-        setStatus('Could not load the selected image file', true);
+      }).catch(function (err) {
+        console.error(err);
+        setStatus('Could not read the image file: ' + err.message, true);
         analyzeBtn.disabled = false;
         analyzeBtn.classList.add('active');
         analyzeBtn.innerText = 'Analyze Photo';
-      };
-      img.src = URL.createObjectURL(selectedFile);
+      });
     }
 
     boot();
