@@ -21,7 +21,6 @@ export const MAX_BORDER_CONTACT = 150;
 
 /**
  * Chromatic distance of every pixel from the estimated background colour
- * (median a*/b* of the whole frame, since felt is ~80% of every image).
  * @param {cv.Mat} rgb CV_8UC3, RGB order
  * @returns {{dist: Float32Array, bg: [number, number]}}
  */
