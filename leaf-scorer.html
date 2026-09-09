@@ -291,6 +291,12 @@
             return;
           }
 
+          // Print everything JSON-safe for direct comparison against
+          // `python leafscore.py <same image>`'s printed output.
+          const { _debug, ...printable } = r;
+          console.log('[leaf-scorer] full result (compare against Python CLI output):');
+          console.log(JSON.stringify(printable, null, 2));
+
           const isInfected = r.verdict === 'DISEASED';
           result.className = isInfected ? 'infected' : 'healthy';
           resultLabel.innerText = isInfected ? 'Infected' : 'Healthy';

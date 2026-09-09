@@ -198,6 +198,13 @@ export class LeafScorer {
         leaf_pixels: cv.countNonZero(mask),
       },
       quality,
+      // DEBUG: raw feature vector + per-channel gain, for comparing directly
+      // against leafscore.py's own output on the same image. Not part of the
+      // original Python API's return shape — safe to ignore/strip in prod.
+      _debug_features: f,
+      _debug_gain_rgb: gain,
+      _debug_leaf_frac: cv.countNonZero(mask) / (rgba.rows * rgba.cols),
+      _debug_interior_px: n,
       _debug: { mask, interior, normalised, hsv, tissue },
     };
   }
