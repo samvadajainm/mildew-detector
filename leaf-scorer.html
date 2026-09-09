@@ -155,7 +155,15 @@
   import { LeafScorer, disposeResult } from './score.js';
 
   const MODEL_URL = 'model_v2.json';
-  const MAX_SIDE = 1400; // cap resolution for performance; pipeline needs >= 400px per side (MIN_SIDE)
+  // NOTE: leafscore.py never resizes the image — every morphological op in
+  // this pipeline (CHLOR_OPEN, BLOOM_OPEN, the 101px median blur, the 13px
+  // erosion disk, etc.) uses a FIXED PIXEL RADIUS tuned against full-
+  // resolution photos. Downscaling before processing shifts those radii
+  // relative to the leaf and silently changes classification results —
+  // confirmed by testing (tissue % drifted while severity stayed close).
+  // Only clamp truly extreme sizes as a memory safety net, not for "typical
+  // photo" performance.
+  const MAX_SIDE = 6000;
 
   let scorer = null;
   let modelReady = false;
