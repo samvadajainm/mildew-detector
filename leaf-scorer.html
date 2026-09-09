@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>Leaf Scorer</title>
-<script async src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js/dist/opencv.js" onload="window.__cvScriptLoaded = true;"></script>
+<script async src="https://docs.opencv.org/4.9.0/opencv.js" onload="window.__cvScriptLoaded = true;"></script>
 <style>
   :root {
     --forest: #1B3A2E;
@@ -174,7 +174,7 @@
       const start = Date.now();
       const check = () => {
         if (window.cv && window.cv.Mat) { resolve(); return; }
-        if (Date.now() - start > 20000) { reject(new Error('OpenCV.js did not finish loading (timed out)')); return; }
+        if (Date.now() - start > 45000) { reject(new Error('OpenCV.js did not finish loading (timed out)')); return; }
         setTimeout(check, 100);
       };
       check();
