@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>Leaf Scorer</title>
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<script async src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js/dist/opencv.js" onload="window.__cvScriptLoaded = true;"></script>
 <style>
   :root {
     --forest: #1B3A2E;
@@ -15,6 +15,8 @@
     --infected: #B71C1C;
     --gray-disabled: #D9D6CC;
     --error: #B71C1C;
+    --warn-bg: #FDF6E7;
+    --warn-border: #E0A82E;
   }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -22,16 +24,10 @@
     margin: 0;
     padding: 40px 16px;
   }
-  .card { max-width: 460px; margin: 0 auto; }
+  .card { max-width: 480px; margin: 0 auto; }
   h2 { color: #1a1a1a; text-align: center; font-size: 26px; margin: 0 0 6px; }
   #subtitle { text-align: center; color: #555; margin: 0 0 20px; font-size: 15px; }
-  #status {
-    text-align: center;
-    color: #888;
-    margin-bottom: 14px;
-    min-height: 16px;
-    font-size: 13px;
-  }
+  #status { text-align: center; color: #888; margin-bottom: 14px; min-height: 16px; font-size: 13px; }
   #status.error { color: var(--error); font-weight: 600; }
 
   #dropZone {
@@ -60,13 +56,7 @@
   #fileInput { display: none; }
 
   #previewWrap { display: none; }
-  #previewImg {
-    max-width: 100%;
-    max-height: 240px;
-    border-radius: 8px;
-    display: block;
-    margin: 0 auto 14px;
-  }
+  #previewImg { max-width: 100%; max-height: 260px; border-radius: 8px; display: block; margin: 0 auto 14px; }
   #changeImageBtn {
     background: none;
     border: 1px solid var(--mint-border);
@@ -105,12 +95,27 @@
   #result.infected #resultLabel { color: var(--infected); }
   #resultRating { margin-top: 6px; font-size: 14px; color: #555; }
   #resultRating b { font-size: 16px; color: #222; }
+  #tissueBreakdown { margin-top: 12px; font-size: 12px; color: #666; }
+
+  #warnings {
+    display: none;
+    margin-top: 14px;
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 13px;
+    color: #6b5000;
+    text-align: left;
+  }
+  #warnings b { display: block; margin-bottom: 6px; }
+  #warnings ul { margin: 0; padding-left: 18px; }
 </style>
 </head>
 <body>
 <div class="card">
   <h2>Leaf Scorer</h2>
-  <p id="subtitle">Upload one image to check a plant for powdery mildew.</p>
+  <p id="subtitle">Upload one leaf photo on a plain dark background, lit evenly, from directly above.</p>
   <div id="status">Starting…</div>
 
   <div id="dropZone">
@@ -130,84 +135,87 @@
   </div>
   <input id="fileInput" type="file" accept="image/*">
 
-  <canvas id="procCanvas" width="224" height="224"></canvas>
+  <canvas id="procCanvas"></canvas>
 
   <button id="analyzeBtn" disabled>Analyze Photo</button>
 
   <div id="result">
     <div id="resultLabel"></div>
     <div id="resultRating"></div>
+    <div id="tissueBreakdown"></div>
+  </div>
+
+  <div id="warnings">
+    <b>Heads up:</b>
+    <ul id="warningsList"></ul>
   </div>
 </div>
 
-<script>
-(function () {
-  // ── Config — mildew_detector.onnx is untouched; these must match its signature ──
-  var MODEL_URL   = 'mildew_detector.onnx';
-  var INPUT_NAME  = 'serving_default_image_input:0';
-  var OUTPUT_NAME = 'StatefulPartitionedCall_1:0';
-  var INPUT_SIZE  = 224;
-  var RATING_THRESHOLD = 4; // rating > 4 => Infected
+<script type="module">
+  import { LeafScorer, disposeResult } from './score.js';
 
-  var session = null;
-  var modelReady = false;
-  var selectedFile = null;
+  const MODEL_URL = 'model_v2.json';
+  const MAX_SIDE = 1400; // cap resolution for performance; pipeline needs >= 400px per side (MIN_SIDE)
+
+  let scorer = null;
+  let modelReady = false;
+  let selectedFile = null;
 
   function log(msg) { console.log('[leaf-scorer] ' + msg); }
   function setStatus(msg, isError) {
-    var el = document.getElementById('status');
+    const el = document.getElementById('status');
     el.innerText = msg;
     el.className = isError ? 'error' : '';
     log((isError ? 'ERROR: ' : '') + msg);
   }
 
+  function waitForCv() {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      const check = () => {
+        if (window.cv && window.cv.Mat) { resolve(); return; }
+        if (Date.now() - start > 20000) { reject(new Error('OpenCV.js did not finish loading (timed out)')); return; }
+        setTimeout(check, 100);
+      };
+      check();
+    });
+  }
+
   function init() {
     log('DOM ready — wiring up UI');
 
-    var dropZone     = document.getElementById('dropZone');
-    var selectBtn    = document.getElementById('selectBtn');
-    var dropZoneSub  = document.getElementById('dropZoneSub');
-    var previewWrap  = document.getElementById('previewWrap');
-    var previewImg   = document.getElementById('previewImg');
-    var changeBtn    = document.getElementById('changeImageBtn');
-    var fileInput    = document.getElementById('fileInput');
-    var analyzeBtn   = document.getElementById('analyzeBtn');
-    var result       = document.getElementById('result');
-    var resultLabel  = document.getElementById('resultLabel');
-    var resultRating = document.getElementById('resultRating');
-    var canvas       = document.getElementById('procCanvas');
-    var ctx          = canvas.getContext('2d');
+    const dropZone       = document.getElementById('dropZone');
+    const selectBtn       = document.getElementById('selectBtn');
+    const dropZoneSub     = document.getElementById('dropZoneSub');
+    const previewWrap     = document.getElementById('previewWrap');
+    const previewImg      = document.getElementById('previewImg');
+    const changeBtn        = document.getElementById('changeImageBtn');
+    const fileInput        = document.getElementById('fileInput');
+    const analyzeBtn       = document.getElementById('analyzeBtn');
+    const result           = document.getElementById('result');
+    const resultLabel      = document.getElementById('resultLabel');
+    const resultRating     = document.getElementById('resultRating');
+    const tissueBreakdown  = document.getElementById('tissueBreakdown');
+    const warnings         = document.getElementById('warnings');
+    const warningsList     = document.getElementById('warningsList');
+    const canvas           = document.getElementById('procCanvas');
+    const ctx               = canvas.getContext('2d');
 
-    // ── Image selection works immediately — NOT gated behind model load ──
-    selectBtn.addEventListener('click', function () {
-      log('Select Image clicked');
-      fileInput.click();
-    });
-    changeBtn.addEventListener('click', function () {
-      log('Change image clicked');
-      fileInput.click();
-    });
+    // ── Image selection works immediately — not gated on model/OpenCV load ──
+    selectBtn.addEventListener('click', () => { log('Select Image clicked'); fileInput.click(); });
+    changeBtn.addEventListener('click', () => { log('Change image clicked'); fileInput.click(); });
 
-    dropZone.addEventListener('dragover', function (e) {
-      e.preventDefault();
-      dropZone.classList.add('dragover');
-    });
-    dropZone.addEventListener('dragleave', function () {
-      dropZone.classList.remove('dragover');
-    });
-    dropZone.addEventListener('drop', function (e) {
+    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', (e) => {
       e.preventDefault();
       dropZone.classList.remove('dragover');
-      if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-        handleFile(e.dataTransfer.files[0]);
-      }
+      if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
     });
 
-    fileInput.addEventListener('change', function () {
-      log('File input change event, files=' + fileInput.files.length);
-      if (fileInput.files && fileInput.files[0]) {
-        handleFile(fileInput.files[0]);
-      }
+    fileInput.addEventListener('change', () => {
+      log('File input change, files=' + fileInput.files.length);
+      if (fileInput.files && fileInput.files[0]) handleFile(fileInput.files[0]);
     });
 
     function handleFile(file) {
@@ -221,6 +229,7 @@
       previewWrap.style.display = 'block';
 
       result.style.display = 'none';
+      warnings.style.display = 'none';
 
       if (modelReady) {
         analyzeBtn.disabled = false;
@@ -229,20 +238,14 @@
       } else {
         analyzeBtn.disabled = true;
         analyzeBtn.classList.remove('active');
-        setStatus('Image selected — waiting for model to finish loading…');
+        setStatus('Image selected — waiting for the model to finish loading…');
       }
     }
 
-    analyzeBtn.addEventListener('click', function () {
+    analyzeBtn.addEventListener('click', () => {
       log('Analyze clicked, modelReady=' + modelReady + ' selectedFile=' + !!selectedFile);
-      if (!selectedFile) {
-        setStatus('Select an image first', true);
-        return;
-      }
-      if (!modelReady || !session) {
-        setStatus('Model is not ready yet — please wait a moment and try again', true);
-        return;
-      }
+      if (!selectedFile) { setStatus('Select an image first', true); return; }
+      if (!modelReady || !scorer) { setStatus('Model is not ready yet — please wait a moment and try again', true); return; }
       runInference();
     });
 
@@ -251,55 +254,66 @@
       analyzeBtn.classList.remove('active');
       analyzeBtn.innerText = 'Analyzing…';
       result.style.display = 'none';
+      warnings.style.display = 'none';
       setStatus('Running inference…');
 
-      var img = new Image();
-      img.onload = function () {
+      const img = new Image();
+      img.onload = () => {
         try {
-          ctx.drawImage(img, 0, 0, INPUT_SIZE, INPUT_SIZE);
-          var imageData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+          let w = img.naturalWidth, h = img.naturalHeight;
+          if (Math.max(w, h) > MAX_SIDE) {
+            const scale = MAX_SIDE / Math.max(w, h);
+            w = Math.round(w * scale);
+            h = Math.round(h * scale);
+          }
+          canvas.width = w;
+          canvas.height = h;
+          ctx.drawImage(img, 0, 0, w, h);
 
-          // NHWC float32, raw 0-255 values, no normalization
-          var floatData = new Float32Array(INPUT_SIZE * INPUT_SIZE * 3);
-          for (var i = 0, j = 0; i < imageData.length; i += 4, j += 3) {
-            floatData[j]     = imageData[i];
-            floatData[j + 1] = imageData[i + 1];
-            floatData[j + 2] = imageData[i + 2];
+          const rgba = cv.imread(canvas);
+          const r = scorer.score(rgba);
+          rgba.delete();
+
+          if (!r.ok) {
+            setStatus(r.detail || r.error, true);
+            result.style.display = 'none';
+            analyzeBtn.disabled = false;
+            analyzeBtn.classList.add('active');
+            analyzeBtn.innerText = 'Analyze Photo';
+            return;
           }
 
-          var tensor = new ort.Tensor('float32', floatData, [1, INPUT_SIZE, INPUT_SIZE, 3]);
-          var feeds = {};
-          feeds[INPUT_NAME] = tensor;
+          const isInfected = r.verdict === 'DISEASED';
+          result.className = isInfected ? 'infected' : 'healthy';
+          resultLabel.innerText = isInfected ? 'Infected' : 'Healthy';
+          resultRating.innerHTML = 'Rating: <b>' + r.severity_0_10.toFixed(1) + ' / 10</b>';
+          tissueBreakdown.innerText =
+            'Healthy tissue ' + r.tissue.healthy_pct + '% · Chlorotic ' + r.tissue.chlorotic_pct +
+            '% · Bloom ' + r.tissue.bloom_pct + '%';
+          result.style.display = 'block';
 
-          session.run(feeds).then(function (output) {
-            log('Inference complete');
-            var score = output[OUTPUT_NAME].data[0];
-            var rating = Math.round(score * 10 * 10) / 10;
-            var isInfected = rating > RATING_THRESHOLD;
+          if (r.quality.warnings && r.quality.warnings.length > 0) {
+            warningsList.innerHTML = '';
+            r.quality.warnings.forEach((w) => {
+              const li = document.createElement('li');
+              li.innerText = w;
+              warningsList.appendChild(li);
+            });
+            warnings.style.display = 'block';
+          }
 
-            result.className = isInfected ? 'infected' : 'healthy';
-            resultLabel.innerText = isInfected ? 'Infected' : 'Healthy';
-            resultRating.innerHTML = 'Rating: <b>' + rating.toFixed(1) + ' / 10</b>';
-            result.style.display = 'block';
-            setStatus('Done');
-
-            analyzeBtn.disabled = false;
-            analyzeBtn.classList.add('active');
-            analyzeBtn.innerText = 'Analyze Photo';
-          }).catch(function (err) {
-            setStatus('Inference failed: ' + err.message, true);
-            analyzeBtn.disabled = false;
-            analyzeBtn.classList.add('active');
-            analyzeBtn.innerText = 'Analyze Photo';
-          });
+          disposeResult(r);
+          setStatus('Done');
         } catch (err) {
-          setStatus('Preprocessing failed: ' + err.message, true);
-          analyzeBtn.disabled = false;
-          analyzeBtn.classList.add('active');
-          analyzeBtn.innerText = 'Analyze Photo';
+          console.error(err);
+          setStatus('Analysis failed: ' + err.message, true);
         }
+
+        analyzeBtn.disabled = false;
+        analyzeBtn.classList.add('active');
+        analyzeBtn.innerText = 'Analyze Photo';
       };
-      img.onerror = function () {
+      img.onerror = () => {
         setStatus('Could not load the selected image file', true);
         analyzeBtn.disabled = false;
         analyzeBtn.classList.add('active');
@@ -308,28 +322,30 @@
       img.src = URL.createObjectURL(selectedFile);
     }
 
-    loadModel();
+    boot();
 
-    function loadModel() {
-      if (typeof ort === 'undefined') {
-        setStatus('onnxruntime-web failed to load from CDN — check your network/ad-blocker', true);
-        return;
-      }
-      setStatus('Loading model…');
-      ort.InferenceSession.create(MODEL_URL).then(function (s) {
-        session = s;
+    async function boot() {
+      try {
+        setStatus('Loading OpenCV…');
+        await waitForCv();
+        log('OpenCV ready');
+
+        setStatus('Loading model…');
+        scorer = await LeafScorer.load(MODEL_URL);
         modelReady = true;
-        log('Model loaded. Inputs=' + s.inputNames.join(',') + ' Outputs=' + s.outputNames.join(','));
+        log('Model loaded');
+
         if (selectedFile) {
           analyzeBtn.disabled = false;
           analyzeBtn.classList.add('active');
           setStatus('Ready to analyze');
         } else {
-          setStatus('Model ready — select an image');
+          setStatus('Ready — select an image');
         }
-      }).catch(function (err) {
-        setStatus('Failed to load model: ' + err.message + ' (check that mildew_detector.onnx is in the same folder as this page)', true);
-      });
+      } catch (err) {
+        console.error(err);
+        setStatus('Startup failed: ' + err.message, true);
+      }
     }
   }
 
@@ -338,7 +354,6 @@
   } else {
     init();
   }
-})();
 </script>
 </body>
 </html>

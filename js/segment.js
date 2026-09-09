@@ -44,13 +44,19 @@ function bgDistance(rgb) {
   return { dist, bg: [bgA, bgB] };
 }
 
+/**
+ * FIX: Python does `np.clip(dist, 0, 255).astype(np.uint8)`, which
+ * TRUNCATES (floors) positive floats — it does not round. Math.round()
+ * here previously introduced a systematic +0.5-average bias vs the Python
+ * pipeline. Use Math.floor to match numpy's cast semantics exactly.
+ */
 function distToU8Mat(dist, rows, cols) {
   const m = new cv.Mat(rows, cols, cv.CV_8UC1);
   const d = m.data;
   for (let i = 0; i < dist.length; i++) {
     let v = dist[i];
     if (v < 0) v = 0; else if (v > 255) v = 255;
-    d[i] = Math.round(v);
+    d[i] = Math.floor(v);
   }
   return m;
 }
@@ -156,8 +162,18 @@ export function segment(rgb) {
   tmpThresh.delete();
   t = Math.max(t, DIST_FLOOR);
 
-  let m = new cv.Mat();
-  cv.threshold(d8, m, t, 255, cv.THRESH_BINARY);
+  // FIX: Python computes `m = (d8 >= t)` explicitly — an INCLUSIVE
+  // comparison. cv.threshold's THRESH_BINARY applies a strict '>' inside
+  // OpenCV, which silently drops pixels exactly equal to t. Replicate the
+  // inclusive comparison by hand instead of trusting cv.threshold for the
+  // final mask.
+  let m = new cv.Mat(rows, cols, cv.CV_8UC1, new cv.Scalar(0));
+  {
+    const d8Data = d8.data, mData = m.data;
+    for (let i = 0; i < rows * cols; i++) {
+      if (d8Data[i] >= t) mData[i] = 255;
+    }
+  }
   d8.delete();
 
   let k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7, 7));

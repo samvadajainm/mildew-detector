@@ -85,7 +85,12 @@ export function normalise(rgb, maskMat, canon = CANON_RGB) {
   for (let i = 0, n = rows * cols; i < n; i++) {
     for (let c = 0; c < 3; c++) {
       const lin = toLinear(srcData[i * 3 + c] / 255) * gain[c];
-      outData[i * 3 + c] = Math.round(toSrgb(lin) * 255);
+      // FIX: Python's final `.astype(np.uint8)` (after np.clip) TRUNCATES
+      // positive floats rather than rounding. Math.round() previously
+      // diverged from that by up to 1 level per channel per pixel.
+      let v = toSrgb(lin) * 255;
+      if (v < 0) v = 0; else if (v > 255) v = 255;
+      outData[i * 3 + c] = Math.floor(v);
     }
   }
   return { normalised: out, gain };
