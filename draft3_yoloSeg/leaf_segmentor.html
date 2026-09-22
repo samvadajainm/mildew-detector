@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Plant Segmenter — Stage 1</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<style>
+  :root {
+    --forest: #1B3A2E;
+    --forest-hover: #142B22;
+    --mint-bg: #EAF3EC;
+    --mint-border: #A9C9B3;
+    --page-bg: #F5F1E6;
+    --error: #B71C1C;
+    --gray-disabled: #D9D6CC;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--page-bg);
+    margin: 0;
+    padding: 40px 16px;
+  }
+  .card { max-width: 520px; margin: 0 auto; }
+  h2 { color: #1a1a1a; text-align: center; font-size: 26px; margin: 0 0 6px; }
+  #subtitle { text-align: center; color: #555; margin: 0 0 20px; font-size: 15px; }
+  #status { text-align: center; color: #888; margin-bottom: 14px; min-height: 16px; font-size: 13px; }
+  #status.error { color: var(--error); font-weight: 600; }
+
+  #dropZone {
+    border: 2px dashed var(--mint-border);
+    border-radius: 14px;
+    background: var(--mint-bg);
+    padding: 40px 24px;
+    text-align: center;
+  }
+  #dropZone.dragover { border-color: var(--forest); }
+  #dropZone svg { display: block; margin: 0 auto 18px; }
+  #selectBtn {
+    background: var(--forest); color: white; border: none;
+    padding: 12px 28px; border-radius: 8px; font-size: 15px;
+    font-weight: 600; cursor: pointer;
+  }
+  #selectBtn:hover { background: var(--forest-hover); }
+  #dropZoneSub { color: #6b6b6b; font-size: 13px; margin-top: 14px; }
+  #fileInput { display: none; }
+  #previewWrap { display: none; }
+  #previewImg { max-width: 100%; max-height: 260px; border-radius: 8px; display: block; margin: 0 auto 14px; }
+  #changeImageBtn {
+    background: none; border: 1px solid var(--mint-border); color: var(--forest);
+    padding: 8px 18px; border-radius: 8px; font-size: 13px; cursor: pointer;
+  }
+  #changeImageBtn:hover { background: #DDEBE1; }
+
+  #analyzeBtn {
+    width: 100%; margin-top: 18px;
+    background: var(--gray-disabled); color: #9c988c; border: none;
+    padding: 15px; border-radius: 10px; font-size: 16px; font-weight: 600;
+    cursor: default; box-sizing: border-box;
+  }
+  #analyzeBtn.active { background: var(--forest); color: white; cursor: pointer; }
+  #analyzeBtn.active:hover { background: var(--forest-hover); }
+
+  #resultWrap { display: none; margin-top: 20px; }
+  #resultWrap canvas {
+    max-width: 100%; border-radius: 8px; display: block; margin: 0 auto 8px;
+    border: 1px solid #ccc;
+  }
+  #resultInfo {
+    text-align: center; font-size: 13px; color: #555; margin-top: 8px;
+  }
+  #resultInfo b { color: #222; }
+
+  #warnings {
+    display: none; margin-top: 14px;
+    background: #FDF6E7; border: 1px solid #E0A82E; border-radius: 10px;
+    padding: 14px 16px; font-size: 13px; color: #6b5000; text-align: left;
+  }
+  #warnings b { display: block; margin-bottom: 6px; }
+  #warnings ul { margin: 0; padding-left: 18px; }
+
+  /* hidden processing canvases */
+  .procCanvas { display: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Plant Segmenter</h2>
+  <p id="subtitle">Upload a plant photo. The model finds and isolates the plant — no disease score yet.</p>
+  <div id="status">Starting…</div>
+
+  <div id="dropZone">
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#7A9184" stroke-width="1.5">
+      <rect x="3" y="3" width="18" height="18" rx="3"/>
+      <circle cx="8.5" cy="8.5" r="1.5"/>
+      <path d="M21 15l-5-5L5 21"/>
+    </svg>
+    <button id="selectBtn" type="button">Select Image</button>
+    <div id="dropZoneSub">Accepted: JPG, JPEG, PNG. One image at a time.</div>
+    <div id="previewWrap">
+      <img id="previewImg" alt="Selected photo">
+      <button id="changeImageBtn" type="button">Choose a different photo</button>
+    </div>
+  </div>
+  <input id="fileInput" type="file" accept="image/*">
+
+  <canvas id="inputCanvas" class="procCanvas"></canvas>
+  <canvas id="outputCanvas" class="procCanvas"></canvas>
+
+  <button id="analyzeBtn" disabled>Segment Plant</button>
+
+  <div id="resultWrap">
+    <canvas id="displayCanvas"></canvas>
+    <div id="resultInfo"></div>
+  </div>
+
+  <div id="warnings">
+    <b>Heads up:</b>
+    <ul id="warningsList"></ul>
+  </div>
+</div>
+
+<script>
+(function () {
+  // ── Config ──
+  var MODEL_URL = 'plantseg_v2.onnx';
+  var INPUT_SIZE = 640;
+  var CONF_THRESHOLD = 0.25;
+  var IOU_THRESHOLD = 0.7;
+  var MASK_THRESHOLD = 0.5;
+  var MIN_AREA_FRAC = 0.02;
+  var MAX_AREA_FRAC = 0.80;
+  var FRAME_MARGIN = 2;
+  var OUTLINE_COLOR = [0, 255, 120];
+  var DIM_FACTOR = 0.45;
+
+  var session = null;
+  var modelReady = false;
+  var selectedFile = null;
+
+  function log(msg) { console.log('[plantseg] ' + msg); }
+  function setStatus(msg, isError) {
+    var el = document.getElementById('status');
+    el.innerText = msg;
+    el.className = isError ? 'error' : '';
+    log((isError ? 'ERROR: ' : '') + msg);
+  }
+
+  function init() {
+    log('DOM ready');
+    var dropZone = document.getElementById('dropZone');
+    var selectBtn = document.getElementById('selectBtn');
+    var dropZoneSub = document.getElementById('dropZoneSub');
+    var previewWrap = document.getElementById('previewWrap');
+    var previewImg = document.getElementById('previewImg');
+    var changeBtn = document.getElementById('changeImageBtn');
+    var fileInput = document.getElementById('fileInput');
+    var analyzeBtn = document.getElementById('analyzeBtn');
+    var resultWrap = document.getElementById('resultWrap');
+    var resultInfo = document.getElementById('resultInfo');
+    var warnings = document.getElementById('warnings');
+    var warningsList = document.getElementById('warningsList');
+
+    selectBtn.addEventListener('click', function () { fileInput.click(); });
+    changeBtn.addEventListener('click', function () { fileInput.click(); });
+    dropZone.addEventListener('dragover', function (e) { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', function () { dropZone.classList.remove('dragover'); });
+    dropZone.addEventListener('drop', function (e) {
+      e.preventDefault(); dropZone.classList.remove('dragover');
+      if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', function () {
+      if (fileInput.files && fileInput.files[0]) handleFile(fileInput.files[0]);
+    });
+
+    function handleFile(file) {
+      selectedFile = file;
+      previewImg.src = URL.createObjectURL(file);
+      dropZone.querySelector('svg').style.display = 'none';
+      selectBtn.style.display = 'none';
+      dropZoneSub.style.display = 'none';
+      previewWrap.style.display = 'block';
+      resultWrap.style.display = 'none';
+      warnings.style.display = 'none';
+      if (modelReady) {
+        analyzeBtn.disabled = false;
+        analyzeBtn.classList.add('active');
+        setStatus('Ready to segment');
+      } else {
+        setStatus('Image selected — model still loading…');
+      }
+    }
+
+    analyzeBtn.addEventListener('click', function () {
+      if (!selectedFile || !modelReady) return;
+      runSegmentation();
+    });
+
+    function runSegmentation() {
+      analyzeBtn.disabled = true;
+      analyzeBtn.classList.remove('active');
+      analyzeBtn.innerText = 'Segmenting…';
+      resultWrap.style.display = 'none';
+      warnings.style.display = 'none';
+      setStatus('Running segmentation…');
+
+      var img = new Image();
+      img.onload = function () {
+        try {
+          var origW = img.naturalWidth, origH = img.naturalHeight;
+
+          // ── Preprocess: resize to 640x640 with letterbox padding ──
+          var scale = Math.min(INPUT_SIZE / origW, INPUT_SIZE / origH);
+          var newW = Math.round(origW * scale);
+          var newH = Math.round(origH * scale);
+          var padX = Math.round((INPUT_SIZE - newW) / 2);
+          var padY = Math.round((INPUT_SIZE - newH) / 2);
+
+          var inCanvas = document.getElementById('inputCanvas');
+          inCanvas.width = INPUT_SIZE;
+          inCanvas.height = INPUT_SIZE;
+          var inCtx = inCanvas.getContext('2d');
+          inCtx.fillStyle = '#808080'; // YOLO letterbox padding = gray
+          inCtx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
+          inCtx.drawImage(img, padX, padY, newW, newH);
+          var imageData = inCtx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+
+          // CHW float32 [0,1] — same as the fish detector
+          var floatData = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
+          for (var i = 0; i < INPUT_SIZE * INPUT_SIZE; i++) {
+            var x = i % INPUT_SIZE;
+            var y = Math.floor(i / INPUT_SIZE);
+            floatData[y * INPUT_SIZE + x] = imageData[i * 4] / 255.0;                           // R
+            floatData[INPUT_SIZE * INPUT_SIZE + y * INPUT_SIZE + x] = imageData[i * 4 + 1] / 255.0; // G
+            floatData[2 * INPUT_SIZE * INPUT_SIZE + y * INPUT_SIZE + x] = imageData[i * 4 + 2] / 255.0; // B
+          }
+
+          var tensor = new ort.Tensor('float32', floatData, [1, 3, INPUT_SIZE, INPUT_SIZE]);
+
+          session.run({ images: tensor }).then(function (results) {
+            var output0 = results.output0;  // [1, 37, 8400]
+            var output1 = results.output1;  // [1, 32, 160, 160]
+
+            var numDetections = output0.dims[2]; // 8400
+            var numProto = 32;
+            var protoH = 160, protoW = 160;
+
+            // ── Parse detections ──
+            var detections = [];
+            for (var d = 0; d < numDetections; d++) {
+              var conf = output0.data[4 * numDetections + d]; // class 0 confidence
+              if (conf < CONF_THRESHOLD) continue;
+
+              var cx = output0.data[0 * numDetections + d];
+              var cy = output0.data[1 * numDetections + d];
+              var w  = output0.data[2 * numDetections + d];
+              var h  = output0.data[3 * numDetections + d];
+
+              var maskCoeffs = new Float32Array(numProto);
+              for (var m = 0; m < numProto; m++) {
+                maskCoeffs[m] = output0.data[(5 + m) * numDetections + d];
+              }
+
+              detections.push({ cx: cx, cy: cy, w: w, h: h, conf: conf, maskCoeffs: maskCoeffs });
+            }
+
+            // ── NMS ──
+            detections.sort(function (a, b) { return b.conf - a.conf; });
+            var kept = [];
+            for (var i = 0; i < detections.length; i++) {
+              var dominated = false;
+              for (var j = 0; j < kept.length; j++) {
+                if (computeIoU(detections[i], kept[j]) >= IOU_THRESHOLD) {
+                  dominated = true; break;
+                }
+              }
+              if (!dominated) kept.push(detections[i]);
+            }
+
+            log(kept.length + ' detections after NMS');
+
+            // ── Build combined mask ──
+            var protoData = output1.data; // [1, 32, 160, 160] flat
+            var combinedMask = new Float32Array(protoH * protoW); // 160x160
+
+            for (var k = 0; k < kept.length; k++) {
+              var det = kept[k];
+              // Compute mask = sigmoid(coeffs @ prototypes)
+              for (var py = 0; py < protoH; py++) {
+                for (var px = 0; px < protoW; px++) {
+                  var val = 0;
+                  for (var m = 0; m < numProto; m++) {
+                    val += det.maskCoeffs[m] * protoData[m * protoH * protoW + py * protoW + px];
+                  }
+                  val = 1.0 / (1.0 + Math.exp(-val)); // sigmoid
+                  if (val > MASK_THRESHOLD) {
+                    // Crop to bounding box (in 160x160 space)
+                    var bx1 = (det.cx - det.w / 2) * (protoW / INPUT_SIZE);
+                    var by1 = (det.cy - det.h / 2) * (protoH / INPUT_SIZE);
+                    var bx2 = (det.cx + det.w / 2) * (protoW / INPUT_SIZE);
+                    var by2 = (det.cy + det.h / 2) * (protoH / INPUT_SIZE);
+                    if (px >= bx1 && px <= bx2 && py >= by1 && py <= by2) {
+                      combinedMask[py * protoW + px] = 1.0;
+                    }
+                  }
+                }
+              }
+            }
+
+            // ── Resize mask from 160x160 → original image size ──
+            // Un-letterbox: map from 640-space proto to original image coords
+            var fullMask = new Uint8Array(origW * origH);
+            for (var oy = 0; oy < origH; oy++) {
+              for (var ox = 0; ox < origW; ox++) {
+                // Map original pixel to 160x160 proto space
+                var mx = ((ox * scale + padX) / INPUT_SIZE) * protoW;
+                var my = ((oy * scale + padY) / INPUT_SIZE) * protoH;
+                var mi = Math.floor(my) * protoW + Math.floor(mx);
+                if (mi >= 0 && mi < protoH * protoW && combinedMask[mi] > 0) {
+                  fullMask[oy * origW + ox] = 255;
+                }
+              }
+            }
+
+            // ── Compute stats ──
+            var plantPixels = 0;
+            for (var i = 0; i < fullMask.length; i++) if (fullMask[i]) plantPixels++;
+            var areaFrac = plantPixels / (origW * origH);
+            var bestConf = kept.length > 0 ? kept[0].conf : 0;
+
+            var touchesEdge = false;
+            if (plantPixels > 0) {
+              for (var x = 0; x < origW; x++) {
+                for (var y = 0; y < FRAME_MARGIN; y++) if (fullMask[y * origW + x]) { touchesEdge = true; break; }
+                if (touchesEdge) break;
+                for (var y = origH - FRAME_MARGIN; y < origH; y++) if (fullMask[y * origW + x]) { touchesEdge = true; break; }
+                if (touchesEdge) break;
+              }
+              if (!touchesEdge) {
+                for (var y = 0; y < origH; y++) {
+                  for (var x = 0; x < FRAME_MARGIN; x++) if (fullMask[y * origW + x]) { touchesEdge = true; break; }
+                  if (touchesEdge) break;
+                  for (var x = origW - FRAME_MARGIN; x < origW; x++) if (fullMask[y * origW + x]) { touchesEdge = true; break; }
+                  if (touchesEdge) break;
+                }
+              }
+            }
+
+            var warns = [];
+            if (plantPixels === 0) warns.push('No plant found in the image');
+            else {
+              if (areaFrac < MIN_AREA_FRAC) warns.push('Plant is very small in frame');
+              if (areaFrac > MAX_AREA_FRAC) warns.push('Mask covers most of the frame — background may not have separated correctly');
+              if (bestConf < 0.50) warns.push('Low confidence detection');
+              if (touchesEdge) warns.push('Plant touches the edge of the frame');
+            }
+
+            // ── Render outline overlay ──
+            var outCanvas = document.getElementById('outputCanvas');
+            outCanvas.width = origW;
+            outCanvas.height = origH;
+            var outCtx = outCanvas.getContext('2d');
+            outCtx.drawImage(img, 0, 0, origW, origH);
+
+            var outImgData = outCtx.getImageData(0, 0, origW, origH);
+            var outPx = outImgData.data;
+
+            // Dim everything outside the mask
+            for (var i = 0; i < origW * origH; i++) {
+              if (!fullMask[i]) {
+                outPx[i * 4]     = Math.round(outPx[i * 4] * DIM_FACTOR);
+                outPx[i * 4 + 1] = Math.round(outPx[i * 4 + 1] * DIM_FACTOR);
+                outPx[i * 4 + 2] = Math.round(outPx[i * 4 + 2] * DIM_FACTOR);
+              }
+            }
+
+            // Draw outline (find mask border pixels)
+            var thickness = Math.max(2, Math.round(Math.min(origW, origH) / 250));
+            for (var y = 0; y < origH; y++) {
+              for (var x = 0; x < origW; x++) {
+                if (!fullMask[y * origW + x]) continue;
+                var isBorder = false;
+                for (var dy = -thickness; dy <= thickness && !isBorder; dy++) {
+                  for (var dx = -thickness; dx <= thickness && !isBorder; dx++) {
+                    var nx = x + dx, ny = y + dy;
+                    if (nx < 0 || ny < 0 || nx >= origW || ny >= origH || !fullMask[ny * origW + nx]) {
+                      isBorder = true;
+                    }
+                  }
+                }
+                if (isBorder) {
+                  var idx = (y * origW + x) * 4;
+                  outPx[idx] = OUTLINE_COLOR[0];
+                  outPx[idx + 1] = OUTLINE_COLOR[1];
+                  outPx[idx + 2] = OUTLINE_COLOR[2];
+                }
+              }
+            }
+
+            outCtx.putImageData(outImgData, 0, 0);
+
+            // ── Show result ──
+            var displayCanvas = document.getElementById('displayCanvas');
+            var displayScale = Math.min(500 / origW, 500 / origH, 1);
+            displayCanvas.width = Math.round(origW * displayScale);
+            displayCanvas.height = Math.round(origH * displayScale);
+            var dCtx = displayCanvas.getContext('2d');
+            dCtx.drawImage(outCanvas, 0, 0, displayCanvas.width, displayCanvas.height);
+
+            resultWrap.style.display = 'block';
+            resultInfo.innerHTML = 'Plant area: <b>' + (areaFrac * 100).toFixed(1) + '%</b> of frame' +
+              '&nbsp;&nbsp;·&nbsp;&nbsp;Confidence: <b>' + (bestConf * 100).toFixed(0) + '%</b>';
+
+            if (warns.length > 0) {
+              warningsList.innerHTML = '';
+              warns.forEach(function (w) {
+                var li = document.createElement('li');
+                li.innerText = w;
+                warningsList.appendChild(li);
+              });
+              warnings.style.display = 'block';
+            }
+
+            setStatus('Done');
+            analyzeBtn.disabled = false;
+            analyzeBtn.classList.add('active');
+            analyzeBtn.innerText = 'Segment Plant';
+          }).catch(function (err) {
+            console.error(err);
+            setStatus('Inference failed: ' + err.message, true);
+            analyzeBtn.disabled = false;
+            analyzeBtn.classList.add('active');
+            analyzeBtn.innerText = 'Segment Plant';
+          });
+        } catch (err) {
+          console.error(err);
+          setStatus('Processing failed: ' + err.message, true);
+          analyzeBtn.disabled = false;
+          analyzeBtn.classList.add('active');
+          analyzeBtn.innerText = 'Segment Plant';
+        }
+      };
+      img.onerror = function () {
+        setStatus('Could not load the image', true);
+        analyzeBtn.disabled = false;
+        analyzeBtn.classList.add('active');
+        analyzeBtn.innerText = 'Segment Plant';
+      };
+      img.src = URL.createObjectURL(selectedFile);
+    }
+
+    function computeIoU(a, b) {
+      var ax1 = a.cx - a.w / 2, ay1 = a.cy - a.h / 2, ax2 = a.cx + a.w / 2, ay2 = a.cy + a.h / 2;
+      var bx1 = b.cx - b.w / 2, by1 = b.cy - b.h / 2, bx2 = b.cx + b.w / 2, by2 = b.cy + b.h / 2;
+      var ix1 = Math.max(ax1, bx1), iy1 = Math.max(ay1, by1);
+      var ix2 = Math.min(ax2, bx2), iy2 = Math.min(ay2, by2);
+      var iw = Math.max(0, ix2 - ix1), ih = Math.max(0, iy2 - iy1);
+      var inter = iw * ih;
+      var areaA = a.w * a.h, areaB = b.w * b.h;
+      return inter / (areaA + areaB - inter);
+    }
+
+    // ── Load model ──
+    setStatus('Loading model (' + MODEL_URL + ')…');
+    ort.InferenceSession.create(MODEL_URL, {
+      executionProviders: ['wasm']
+    }).then(function (s) {
+      session = s;
+      modelReady = true;
+      log('Model loaded. Inputs: ' + s.inputNames + '  Outputs: ' + s.outputNames);
+      if (selectedFile) {
+        analyzeBtn.disabled = false;
+        analyzeBtn.classList.add('active');
+        setStatus('Ready to segment');
+      } else {
+        setStatus('Model ready — select an image');
+      }
+    }).catch(function (err) {
+      console.error(err);
+      setStatus('Failed to load model: ' + err.message, true);
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>
