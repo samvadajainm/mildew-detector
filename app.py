@@ -9,6 +9,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "draft3-yoloSeg"))
 # Override the WEIGHTS path since plantseg.py looks for model/ relative to itself
 import plantseg
 plantseg.WEIGHTS = os.path.join(os.path.dirname(__file__),
-                                "draft3-yoloSeg", "model", "plantseg_v2.pt")
+                                "draft3-yoloSeg", "model", "plantseg.pt")
 
 from serve_example import app  # noqa: E402, F401
