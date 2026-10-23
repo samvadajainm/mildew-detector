@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Mildew Scorer — Full Pipeline</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js"></script>
+<style>
+  :root {
+    --forest: #1B3A2E;
+    --forest-hover: #142B22;
+    --mint-bg: #EAF3EC;
+    --mint-border: #A9C9B3;
+    --page-bg: #F5F1E6;
+    --error: #B71C1C;
+    --gray-disabled: #D9D6CC;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--page-bg);
+    margin: 0;
+    padding: 40px 16px;
+  }
+  .card { max-width: 580px; margin: 0 auto; }
+  h2 { color: #1a1a1a; text-align: center; font-size: 26px; margin: 0 0 6px; }
+  #subtitle { text-align: center; color: #555; margin: 0 0 20px; font-size: 15px; }
+  #status { text-align: center; color: #888; margin-bottom: 14px; min-height: 16px; font-size: 13px; }
+  #status.error { color: var(--error); font-weight: 600; }
+
+  #dropZone {
+    border: 2px dashed var(--mint-border);
+    border-radius: 14px;
+    background: var(--mint-bg);
+    padding: 40px 24px;
+    text-align: center;
+  }
+  #dropZone.dragover { border-color: var(--forest); }
+  #dropZone svg { display: block; margin: 0 auto 18px; }
+  #selectBtn {
+    background: var(--forest); color: white; border: none;
+    padding: 12px 28px; border-radius: 8px; font-size: 15px;
+    font-weight: 600; cursor: pointer;
+  }
+  #selectBtn:hover { background: var(--forest-hover); }
+  #dropZoneSub { color: #6b6b6b; font-size: 13px; margin-top: 14px; }
+  #fileInput { display: none; }
+  #previewWrap { display: none; }
+  #previewImg { max-width: 100%; max-height: 260px; border-radius: 8px; display: block; margin: 0 auto 14px; }
+  #changeImageBtn {
+    background: none; border: 1px solid var(--mint-border); color: var(--forest);
+    padding: 8px 18px; border-radius: 8px; font-size: 13px; cursor: pointer;
+  }
+  #changeImageBtn:hover { background: #DDEBE1; }
+
+  #analyzeBtn {
+    width: 100%; margin-top: 18px;
+    background: var(--gray-disabled); color: #9c988c; border: none;
+    padding: 15px; border-radius: 10px; font-size: 16px; font-weight: 600;
+    cursor: default; box-sizing: border-box;
+  }
+  #analyzeBtn.active { background: var(--forest); color: white; cursor: pointer; }
+  #analyzeBtn.active:hover { background: var(--forest-hover); }
+
+  #progressWrap { display: none; margin-top: 14px; }
+  #progressBar {
+    width: 100%; height: 8px; border-radius: 4px;
+    background: #ddd; overflow: hidden;
+  }
+  #progressFill {
+    height: 100%; width: 0%; border-radius: 4px;
+    background: var(--forest); transition: width 0.3s;
+  }
+  #progressLabel { text-align: center; font-size: 12px; color: #888; margin-top: 6px; }
+
+  #resultWrap { display: none; margin-top: 20px; }
+
+  .verdict-box {
+    border-radius: 12px; padding: 16px 20px; margin-bottom: 16px;
+    text-align: center;
+  }
+  .verdict-box.healthy { background: #E8F5E9; border: 2px solid #4CAF50; }
+  .verdict-box.mild { background: #FFF8E1; border: 2px solid #FFC107; }
+  .verdict-box.severe { background: #FFEBEE; border: 2px solid #F44336; }
+  .verdict-label { font-size: 24px; font-weight: 700; margin-bottom: 4px; }
+  .verdict-box.healthy .verdict-label { color: #2E7D32; }
+  .verdict-box.mild .verdict-label { color: #F57F17; }
+  .verdict-box.severe .verdict-label { color: #C62828; }
+  .verdict-detail { font-size: 14px; color: #555; }
+
+  #resultCanvases { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  #resultCanvases canvas {
+    max-width: 48%; border-radius: 8px; display: block;
+    border: 1px solid #ccc;
+  }
+  .canvas-label { text-align: center; font-size: 12px; color: #777; margin-top: 2px; margin-bottom: 10px; width: 48%; }
+
+  #resultInfo {
+    text-align: center; font-size: 13px; color: #555; margin-top: 12px;
+  }
+  #resultInfo b { color: #222; }
+
+  #warnings {
+    display: none; margin-top: 14px;
+    background: #FDF6E7; border: 1px solid #E0A82E; border-radius: 10px;
+    padding: 14px 16px; font-size: 13px; color: #6b5000; text-align: left;
+  }
+  #warnings b { display: block; margin-bottom: 6px; }
+  #warnings ul { margin: 0; padding-left: 18px; }
+
+  .procCanvas { display: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Mildew Scorer</h2>
+  <p id="subtitle">Full pipeline: plant segmentation → tissue classification → severity score</p>
+  <div id="status">Loading models…</div>
+
+  <div id="dropZone">
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#7A9184" stroke-width="1.5">
+      <rect x="3" y="3" width="18" height="18" rx="3"/>
+      <circle cx="8.5" cy="8.5" r="1.5"/>
+      <path d="M21 15l-5-5L5 21"/>
+    </svg>
+    <button id="selectBtn" type="button">Select Image</button>
+    <div id="dropZoneSub">Accepted: JPG, JPEG, PNG. One image at a time.</div>
+    <div id="previewWrap">
+      <img id="previewImg" alt="Selected photo">
+      <button id="changeImageBtn" type="button">Choose a different photo</button>
+    </div>
+  </div>
+  <input id="fileInput" type="file" accept="image/*">
+
+  <canvas id="inputCanvas" class="procCanvas"></canvas>
+
+  <button id="analyzeBtn" disabled>Score Mildew</button>
+
+  <div id="progressWrap">
+    <div id="progressBar"><div id="progressFill"></div></div>
+    <div id="progressLabel"></div>
+  </div>
+
+  <div id="resultWrap">
+    <div id="verdictBox" class="verdict-box">
+      <div class="verdict-label" id="verdictLabel"></div>
+      <div class="verdict-detail" id="verdictDetail"></div>
+    </div>
+    <div id="resultCanvases">
+      <canvas id="segCanvas"></canvas>
+      <canvas id="mildewCanvas"></canvas>
+      <div class="canvas-label">Plant found</div>
+      <div class="canvas-label">Mildew detected (magenta)</div>
+    </div>
+    <div id="resultInfo"></div>
+  </div>
+
+  <div id="warnings">
+    <b>Heads up:</b>
+    <ul id="warningsList"></ul>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ── Pipeline config (from pipeline.json) ──
+  var CUT_T1 = 0.03524000017205253;
+  var CUT_T2 = 0.2003050521016121;
+  var CLASSES = ['healthy', 'mild', 'severe'];
+  var INPUT_SIZE_TISSUE = 512;
+  var TILE_OVERLAP = 0.5;
+  var LONG_EDGE = 2048;
+  var JPEG_QUALITY = 0.95;
+
+  // ImageNet normalisation
+  var MEAN = [0.485, 0.456, 0.406];
+  var STD  = [0.229, 0.224, 0.225];
+
+  // Stage 1 (plantseg) config — same as draft3
+  var PLANTSEG_INPUT = 640;
+  var CONF_THRESHOLD = 0.25;
+  var IOU_THRESHOLD = 0.7;
+  var MASK_THRESHOLD = 0.5;
+  var MIN_AREA_FRAC = 0.02;
+  var MAX_AREA_FRAC = 0.80;
+  var FRAME_MARGIN = 2;
+  var OUTLINE_COLOR = [0, 255, 120];
+  var DIM_FACTOR = 0.45;
+  var MILDEW_COLOR = [255, 0, 255]; // magenta in RGB
+
+  // Models
+  var plantSession = null;
+  var tissueModels = [];  // array of 3 ONNX sessions
+  var modelsReady = false;
+  var selectedFile = null;
+
+  function log(msg) { console.log('[mildewscore] ' + msg); }
+  function setStatus(msg, isError) {
+    var el = document.getElementById('status');
+    el.innerText = msg;
+    el.className = isError ? 'error' : '';
+    log((isError ? 'ERROR: ' : '') + msg);
+  }
+  function setProgress(pct, label) {
+    document.getElementById('progressWrap').style.display = 'block';
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('progressLabel').innerText = label;
+  }
+
+  // ── Stage 1: Plant Segmentation (same logic as draft3) ──
+  function runPlantSeg(imgEl, origW, origH) {
+    return new Promise(function (resolve, reject) {
+      var scale = Math.min(PLANTSEG_INPUT / origW, PLANTSEG_INPUT / origH);
+      var newW = Math.round(origW * scale);
+      var newH = Math.round(origH * scale);
+      var padX = Math.round((PLANTSEG_INPUT - newW) / 2);
+      var padY = Math.round((PLANTSEG_INPUT - newH) / 2);
+
+      var c = document.getElementById('inputCanvas');
+      c.width = PLANTSEG_INPUT; c.height = PLANTSEG_INPUT;
+      var ctx = c.getContext('2d');
+      ctx.fillStyle = '#808080';
+      ctx.fillRect(0, 0, PLANTSEG_INPUT, PLANTSEG_INPUT);
+      ctx.drawImage(imgEl, padX, padY, newW, newH);
+      var imageData = ctx.getImageData(0, 0, PLANTSEG_INPUT, PLANTSEG_INPUT).data;
+
+      var floatData = new Float32Array(3 * PLANTSEG_INPUT * PLANTSEG_INPUT);
+      for (var i = 0; i < PLANTSEG_INPUT * PLANTSEG_INPUT; i++) {
+        floatData[i] = imageData[i * 4] / 255.0;
+        floatData[PLANTSEG_INPUT * PLANTSEG_INPUT + i] = imageData[i * 4 + 1] / 255.0;
+        floatData[2 * PLANTSEG_INPUT * PLANTSEG_INPUT + i] = imageData[i * 4 + 2] / 255.0;
+      }
+
+      var tensor = new ort.Tensor('float32', floatData, [1, 3, PLANTSEG_INPUT, PLANTSEG_INPUT]);
+      plantSession.run({ images: tensor }).then(function (results) {
+        var output0 = results.output0;
+        var output1 = results.output1;
+        var numDet = output0.dims[2];
+        var numProto = 32, protoH = 160, protoW = 160;
+
+        var detections = [];
+        for (var d = 0; d < numDet; d++) {
+          var conf = output0.data[4 * numDet + d];
+          if (conf < CONF_THRESHOLD) continue;
+          var cx = output0.data[0 * numDet + d];
+          var cy = output0.data[1 * numDet + d];
+          var w  = output0.data[2 * numDet + d];
+          var h  = output0.data[3 * numDet + d];
+          var mc = new Float32Array(numProto);
+          for (var m = 0; m < numProto; m++) mc[m] = output0.data[(5 + m) * numDet + d];
+          detections.push({ cx: cx, cy: cy, w: w, h: h, conf: conf, maskCoeffs: mc });
+        }
+
+        detections.sort(function (a, b) { return b.conf - a.conf; });
+        var kept = [];
+        for (var i = 0; i < detections.length; i++) {
+          var dom = false;
+          for (var j = 0; j < kept.length; j++) {
+            if (computeIoU(detections[i], kept[j]) >= IOU_THRESHOLD) { dom = true; break; }
+          }
+          if (!dom) kept.push(detections[i]);
+        }
+
+        var protoData = output1.data;
+        var combinedMask = new Float32Array(protoH * protoW);
+        for (var k = 0; k < kept.length; k++) {
+          var det = kept[k];
+          for (var py = 0; py < protoH; py++) {
+            for (var px = 0; px < protoW; px++) {
+              var val = 0;
+              for (var m = 0; m < numProto; m++) val += det.maskCoeffs[m] * protoData[m * protoH * protoW + py * protoW + px];
+              val = 1.0 / (1.0 + Math.exp(-val));
+              if (val > MASK_THRESHOLD) {
+                var bx1 = (det.cx - det.w / 2) * (protoW / PLANTSEG_INPUT);
+                var by1 = (det.cy - det.h / 2) * (protoH / PLANTSEG_INPUT);
+                var bx2 = (det.cx + det.w / 2) * (protoW / PLANTSEG_INPUT);
+                var by2 = (det.cy + det.h / 2) * (protoH / PLANTSEG_INPUT);
+                if (px >= bx1 && px <= bx2 && py >= by1 && py <= by2) combinedMask[py * protoW + px] = 1.0;
+              }
+            }
+          }
+        }
+
+        var fullMask = new Uint8Array(origW * origH);
+        for (var oy = 0; oy < origH; oy++) {
+          for (var ox = 0; ox < origW; ox++) {
+            var mx = ((ox * scale + padX) / PLANTSEG_INPUT) * protoW;
+            var my = ((oy * scale + padY) / PLANTSEG_INPUT) * protoH;
+            var mi = Math.floor(my) * protoW + Math.floor(mx);
+            if (mi >= 0 && mi < protoH * protoW && combinedMask[mi] > 0) fullMask[oy * origW + ox] = 255;
+          }
+        }
+
+        var plantPixels = 0;
+        for (var i = 0; i < fullMask.length; i++) if (fullMask[i]) plantPixels++;
+        var areaFrac = plantPixels / (origW * origH);
+        var bestConf = kept.length > 0 ? kept[0].conf : 0;
+
+        var warns = [];
+        if (plantPixels === 0) warns.push('No plant found in the image');
+        else {
+          if (areaFrac < MIN_AREA_FRAC) warns.push('Plant is very small in frame');
+          if (areaFrac > MAX_AREA_FRAC) warns.push('Mask covers most of the frame');
+          if (bestConf < 0.50) warns.push('Low confidence detection');
+        }
+
+        resolve({ mask: fullMask, plantPixels: plantPixels, areaFrac: areaFrac, conf: bestConf, warnings: warns });
+      }).catch(reject);
+    });
+  }
+
+  // ── Stage 1b: Normalise (resize to 2048 long edge) ──
+  function normaliseImage(imgEl, origW, origH) {
+    var longEdge = Math.max(origW, origH);
+    var scale = longEdge > LONG_EDGE ? LONG_EDGE / longEdge : 1;
+    var nw = Math.round(origW * scale);
+    var nh = Math.round(origH * scale);
+
+    var c = document.createElement('canvas');
+    c.width = nw; c.height = nh;
+    var ctx = c.getContext('2d');
+    ctx.drawImage(imgEl, 0, 0, nw, nh);
+
+    // JPEG round-trip at q95 for calibration consistency
+    return new Promise(function (resolve) {
+      c.toBlob(function (blob) {
+        var img2 = new Image();
+        img2.onload = function () {
+          var c2 = document.createElement('canvas');
+          c2.width = nw; c2.height = nh;
+          c2.getContext('2d').drawImage(img2, 0, 0, nw, nh);
+          resolve({ canvas: c2, width: nw, height: nh });
+        };
+        img2.src = URL.createObjectURL(blob);
+      }, 'image/jpeg', JPEG_QUALITY);
+    });
+  }
+
+  // ── Stage 2: ResUNet tissue segmentation (tiled, 3-model ensemble) ──
+  function runTissueSeg(normCanvas, nw, nh, plantMaskOrig, origW, origH) {
+    return new Promise(function (resolve, reject) {
+      // Get normalised image pixels (RGB)
+      var ctx = normCanvas.getContext('2d');
+      var imgData = ctx.getImageData(0, 0, nw, nh).data;
+
+      // Rescale plant mask to normalised size
+      var scaleX = nw / origW, scaleY = nh / origH;
+      var plantMask = new Uint8Array(nw * nh);
+      for (var ny = 0; ny < nh; ny++) {
+        for (var nx = 0; nx < nw; nx++) {
+          var ox = Math.min(origW - 1, Math.round(nx / scaleX));
+          var oy = Math.min(origH - 1, Math.round(ny / scaleY));
+          if (plantMaskOrig[oy * origW + ox]) plantMask[ny * nw + nx] = 1;
+        }
+      }
+
+      // Find bounding box of the plant mask (with margin)
+      var minX = nw, maxX = 0, minY = nh, maxY = 0;
+      for (var y = 0; y < nh; y++) {
+        for (var x = 0; x < nw; x++) {
+          if (plantMask[y * nw + x]) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+      var mg = 12;
+      minX = Math.max(0, minX - mg); minY = Math.max(0, minY - mg);
+      maxX = Math.min(nw, maxX + mg); maxY = Math.min(nh, maxY + mg);
+      var cropW = maxX - minX, cropH = maxY - minY;
+
+      // Extract crop pixels (RGB float, zero outside plant mask)
+      var cropRGB = new Float32Array(cropH * cropW * 3);
+      for (var cy = 0; cy < cropH; cy++) {
+        for (var cx = 0; cx < cropW; cx++) {
+          var sx = minX + cx, sy = minY + cy;
+          var srcIdx = (sy * nw + sx) * 4;
+          var dstIdx = (cy * cropW + cx) * 3;
+          if (plantMask[sy * nw + sx]) {
+            cropRGB[dstIdx]     = imgData[srcIdx] / 255.0;
+            cropRGB[dstIdx + 1] = imgData[srcIdx + 1] / 255.0;
+            cropRGB[dstIdx + 2] = imgData[srcIdx + 2] / 255.0;
+          }
+        }
+      }
+
+      // Tile positions (512px tiles, 50% overlap)
+      var tileSize = INPUT_SIZE_TISSUE;
+      var step = Math.max(1, Math.floor(tileSize * (1 - TILE_OVERLAP)));
+
+      // Pad crop if smaller than tile
+      var padH = Math.max(0, tileSize - cropH), padW = Math.max(0, tileSize - cropW);
+      var pH = cropH + padH, pW = cropW + padW;
+
+      // Padded crop
+      var paddedRGB = new Float32Array(pH * pW * 3);
+      for (var y = 0; y < cropH; y++) {
+        for (var x = 0; x < cropW; x++) {
+          var si = (y * cropW + x) * 3;
+          var di = (y * pW + x) * 3;
+          paddedRGB[di] = cropRGB[si];
+          paddedRGB[di + 1] = cropRGB[si + 1];
+          paddedRGB[di + 2] = cropRGB[si + 2];
+        }
+      }
+
+      var ys = [];
+      for (var ty = 0; ty <= Math.max(0, pH - tileSize); ty += step) ys.push(ty);
+      if (pH > tileSize && ys[ys.length - 1] + tileSize < pH) ys.push(pH - tileSize);
+      if (ys.length === 0) ys.push(0);
+
+      var xs = [];
+      for (var tx = 0; tx <= Math.max(0, pW - tileSize); tx += step) xs.push(tx);
+      if (pW > tileSize && xs[xs.length - 1] + tileSize < pW) xs.push(pW - tileSize);
+      if (xs.length === 0) xs.push(0);
+
+      var totalTiles = ys.length * xs.length;
+      var totalRuns = totalTiles * tissueModels.length;
+      var completed = 0;
+
+      // Accumulator for averaged softmax probabilities: 3 classes x pH x pW
+      var accProbs = new Float32Array(3 * pH * pW);
+      var accCount = new Float32Array(pH * pW);
+
+      // Process tiles sequentially (async)
+      var modelIdx = 0;
+      var tileIdx = 0;
+
+      function nextTile() {
+        if (modelIdx >= tissueModels.length) {
+          // All models done. Average probabilities.
+          for (var i = 0; i < pH * pW; i++) {
+            var cnt = accCount[i] || 1;
+            accProbs[i] /= cnt;
+            accProbs[pH * pW + i] /= cnt;
+            accProbs[2 * pH * pW + i] /= cnt;
+          }
+
+          // Argmax → mildew mask (class 1 = mildew)
+          var mildewMask = new Uint8Array(nw * nh);
+          var insidePlant = 0, mildewPixels = 0;
+          for (var cy = 0; cy < cropH; cy++) {
+            for (var cx = 0; cx < cropW; cx++) {
+              var sx = minX + cx, sy = minY + cy;
+              if (!plantMask[sy * nw + sx]) continue;
+              // Check if pixel has non-zero colour (inside crop)
+              var ri = (cy * cropW + cx) * 3;
+              if (cropRGB[ri] === 0 && cropRGB[ri + 1] === 0 && cropRGB[ri + 2] === 0 && !plantMask[sy * nw + sx]) continue;
+              insidePlant++;
+              var pi = cy * pW + cx;
+              var p0 = accProbs[pi];
+              var p1 = accProbs[pH * pW + pi];
+              var p2 = accProbs[2 * pH * pW + pi];
+              if (p1 >= p0 && p1 >= p2) {
+                mildewMask[sy * nw + sx] = 1;
+                mildewPixels++;
+              }
+            }
+          }
+
+          var frac = insidePlant > 0 ? mildewPixels / insidePlant : 0;
+          resolve({ mildewMask: mildewMask, mildewFrac: frac, insidePlant: insidePlant, mildewPixels: mildewPixels, normW: nw, normH: nh, scaleX: scaleX, scaleY: scaleY });
+          return;
+        }
+
+        var yi = Math.floor(tileIdx / xs.length);
+        var xi = tileIdx % xs.length;
+        if (yi >= ys.length) {
+          // Move to next model
+          modelIdx++;
+          tileIdx = 0;
+          setTimeout(nextTile, 0);
+          return;
+        }
+
+        var ty = ys[yi], tx = xs[xi];
+        tileIdx++;
+        completed++;
+        setProgress(20 + 60 * (completed / totalRuns), 'Tissue model ' + (modelIdx + 1) + '/3, tile ' + completed + '/' + totalRuns);
+
+        // Build normalised CHW tensor for this tile
+        var tileData = new Float32Array(3 * tileSize * tileSize);
+        for (var py = 0; py < tileSize; py++) {
+          for (var px = 0; px < tileSize; px++) {
+            var srcY = ty + py, srcX = tx + px;
+            var si = (srcY * pW + srcX) * 3;
+            var r = paddedRGB[si], g = paddedRGB[si + 1], b = paddedRGB[si + 2];
+            var ti = py * tileSize + px;
+            tileData[ti] = (r - MEAN[0]) / STD[0];
+            tileData[tileSize * tileSize + ti] = (g - MEAN[1]) / STD[1];
+            tileData[2 * tileSize * tileSize + ti] = (b - MEAN[2]) / STD[2];
+          }
+        }
+
+        var tensor = new ort.Tensor('float32', tileData, [1, 3, tileSize, tileSize]);
+        tissueModels[modelIdx].run({ input: tensor }).then(function (res) {
+          var out = res.output.data; // [1, 3, 512, 512]
+          // Softmax per pixel and accumulate
+          for (var py = 0; py < tileSize; py++) {
+            for (var px = 0; px < tileSize; px++) {
+              var gy = ty + py, gx = tx + px;
+              if (gy >= pH || gx >= pW) continue;
+              var c0 = out[0 * tileSize * tileSize + py * tileSize + px];
+              var c1 = out[1 * tileSize * tileSize + py * tileSize + px];
+              var c2 = out[2 * tileSize * tileSize + py * tileSize + px];
+              // Softmax
+              var maxC = Math.max(c0, c1, c2);
+              var e0 = Math.exp(c0 - maxC), e1 = Math.exp(c1 - maxC), e2 = Math.exp(c2 - maxC);
+              var sumE = e0 + e1 + e2;
+              var gi = gy * pW + gx;
+              accProbs[gi] += e0 / sumE;
+              accProbs[pH * pW + gi] += e1 / sumE;
+              accProbs[2 * pH * pW + gi] += e2 / sumE;
+              accCount[gi] += 1;
+            }
+          }
+          setTimeout(nextTile, 0);
+        }).catch(reject);
+      }
+
+      nextTile();
+    });
+  }
+
+  // ── Stage 3: Severity classification ──
+  function classify(frac) {
+    if (frac <= CUT_T1) return 0; // healthy
+    if (frac >= CUT_T2) return 2; // severe
+    return 1; // mild
+  }
+
+  // ── IoU helper ──
+  function computeIoU(a, b) {
+    var ax1 = a.cx - a.w / 2, ay1 = a.cy - a.h / 2, ax2 = a.cx + a.w / 2, ay2 = a.cy + a.h / 2;
+    var bx1 = b.cx - b.w / 2, by1 = b.cy - b.h / 2, bx2 = b.cx + b.w / 2, by2 = b.cy + b.h / 2;
+    var iw = Math.max(0, Math.min(ax2, bx2) - Math.max(ax1, bx1));
+    var ih = Math.max(0, Math.min(ay2, by2) - Math.max(ay1, by1));
+    var inter = iw * ih;
+    return inter / (a.w * a.h + b.w * b.h - inter);
+  }
+
+  // ── Render results ──
+  function renderResults(imgEl, origW, origH, plantMask, tissueResult) {
+    var displayScale = Math.min(280 / origW, 280 / origH, 1);
+    var dw = Math.round(origW * displayScale), dh = Math.round(origH * displayScale);
+
+    // Segmentation canvas (plant outline on dimmed background)
+    var segCanvas = document.getElementById('segCanvas');
+    segCanvas.width = dw; segCanvas.height = dh;
+    var segCtx = segCanvas.getContext('2d');
+    segCtx.drawImage(imgEl, 0, 0, dw, dh);
+    var segImg = segCtx.getImageData(0, 0, dw, dh);
+    var segPx = segImg.data;
+
+    for (var y = 0; y < dh; y++) {
+      for (var x = 0; x < dw; x++) {
+        var ox = Math.min(origW - 1, Math.round(x / displayScale));
+        var oy = Math.min(origH - 1, Math.round(y / displayScale));
+        var idx = (y * dw + x) * 4;
+        if (!plantMask[oy * origW + ox]) {
+          segPx[idx] = Math.round(segPx[idx] * DIM_FACTOR);
+          segPx[idx + 1] = Math.round(segPx[idx + 1] * DIM_FACTOR);
+          segPx[idx + 2] = Math.round(segPx[idx + 2] * DIM_FACTOR);
+        }
+      }
+    }
+
+    // Draw outline
+    var thick = Math.max(1, Math.round(Math.min(dw, dh) / 150));
+    for (var y = 0; y < dh; y++) {
+      for (var x = 0; x < dw; x++) {
+        var ox = Math.min(origW - 1, Math.round(x / displayScale));
+        var oy = Math.min(origH - 1, Math.round(y / displayScale));
+        if (!plantMask[oy * origW + ox]) continue;
+        var isBorder = false;
+        for (var dy = -thick; dy <= thick && !isBorder; dy++) {
+          for (var dx = -thick; dx <= thick && !isBorder; dx++) {
+            var nx = x + dx, ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= dw || ny >= dh) { isBorder = true; break; }
+            var nox = Math.min(origW - 1, Math.round(nx / displayScale));
+            var noy = Math.min(origH - 1, Math.round(ny / displayScale));
+            if (!plantMask[noy * origW + nox]) isBorder = true;
+          }
+        }
+        if (isBorder) {
+          var idx = (y * dw + x) * 4;
+          segPx[idx] = OUTLINE_COLOR[0]; segPx[idx + 1] = OUTLINE_COLOR[1]; segPx[idx + 2] = OUTLINE_COLOR[2];
+        }
+      }
+    }
+    segCtx.putImageData(segImg, 0, 0);
+
+    // Mildew canvas (plant + mildew in magenta)
+    var milCanvas = document.getElementById('mildewCanvas');
+    milCanvas.width = dw; milCanvas.height = dh;
+    var milCtx = milCanvas.getContext('2d');
+    milCtx.drawImage(imgEl, 0, 0, dw, dh);
+    var milImg = milCtx.getImageData(0, 0, dw, dh);
+    var milPx = milImg.data;
+
+    // Map the mildew mask (in normalised coords) back to display coords
+    var mMask = tissueResult.mildewMask;
+    var mW = tissueResult.normW, mH = tissueResult.normH;
+
+    for (var y = 0; y < dh; y++) {
+      for (var x = 0; x < dw; x++) {
+        var ox = Math.min(origW - 1, Math.round(x / displayScale));
+        var oy = Math.min(origH - 1, Math.round(y / displayScale));
+        var idx = (y * dw + x) * 4;
+        if (!plantMask[oy * origW + ox]) {
+          milPx[idx] = Math.round(milPx[idx] * DIM_FACTOR);
+          milPx[idx + 1] = Math.round(milPx[idx + 1] * DIM_FACTOR);
+          milPx[idx + 2] = Math.round(milPx[idx + 2] * DIM_FACTOR);
+        } else {
+          // Check mildew mask (normalised space)
+          var nx = Math.min(mW - 1, Math.round(ox * tissueResult.scaleX));
+          var ny = Math.min(mH - 1, Math.round(oy * tissueResult.scaleY));
+          if (mMask[ny * mW + nx]) {
+            // Blend with magenta (55% magenta, 45% original — same as Python)
+            milPx[idx]     = Math.round(0.45 * milPx[idx] + 0.55 * MILDEW_COLOR[0]);
+            milPx[idx + 1] = Math.round(0.45 * milPx[idx + 1] + 0.55 * MILDEW_COLOR[1]);
+            milPx[idx + 2] = Math.round(0.45 * milPx[idx + 2] + 0.55 * MILDEW_COLOR[2]);
+          }
+        }
+      }
+    }
+
+    // Draw plant outline on mildew canvas too
+    for (var y = 0; y < dh; y++) {
+      for (var x = 0; x < dw; x++) {
+        var ox = Math.min(origW - 1, Math.round(x / displayScale));
+        var oy = Math.min(origH - 1, Math.round(y / displayScale));
+        if (!plantMask[oy * origW + ox]) continue;
+        var isBorder = false;
+        for (var dy = -thick; dy <= thick && !isBorder; dy++) {
+          for (var dx = -thick; dx <= thick && !isBorder; dx++) {
+            var nx = x + dx, ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= dw || ny >= dh) { isBorder = true; break; }
+            var nox = Math.min(origW - 1, Math.round(nx / displayScale));
+            var noy = Math.min(origH - 1, Math.round(ny / displayScale));
+            if (!plantMask[noy * origW + nox]) isBorder = true;
+          }
+        }
+        if (isBorder) {
+          var idx = (y * dw + x) * 4;
+          milPx[idx] = OUTLINE_COLOR[0]; milPx[idx + 1] = OUTLINE_COLOR[1]; milPx[idx + 2] = OUTLINE_COLOR[2];
+        }
+      }
+    }
+    milCtx.putImageData(milImg, 0, 0);
+  }
+
+  // ── Main pipeline ──
+  function runPipeline() {
+    var analyzeBtn = document.getElementById('analyzeBtn');
+    analyzeBtn.disabled = true;
+    analyzeBtn.classList.remove('active');
+    analyzeBtn.innerText = 'Scoring…';
+    document.getElementById('resultWrap').style.display = 'none';
+    document.getElementById('warnings').style.display = 'none';
+    setProgress(5, 'Stage 1: Finding the plant…');
+
+    var img = new Image();
+    img.onload = function () {
+      var origW = img.naturalWidth, origH = img.naturalHeight;
+      var t0 = performance.now();
+
+      // Stage 1: Plant segmentation
+      runPlantSeg(img, origW, origH).then(function (s1) {
+        var t1 = performance.now();
+        log('Stage 1 done: ' + s1.plantPixels + ' plant pixels, conf=' + s1.conf.toFixed(2));
+
+        if (s1.plantPixels < 200) {
+          setProgress(100, 'No plant found');
+          setStatus('No plant found in the image', true);
+          showWarnings(s1.warnings);
+          resetBtn();
+          return;
+        }
+
+        setProgress(15, 'Stage 1b: Normalising…');
+
+        // Stage 1b: Normalise
+        normaliseImage(img, origW, origH).then(function (norm) {
+          setProgress(20, 'Stage 2: Tissue segmentation (this takes a while)…');
+
+          // Stage 2: ResUNet tissue segmentation
+          runTissueSeg(norm.canvas, norm.width, norm.height, s1.mask, origW, origH).then(function (tissue) {
+            var t2 = performance.now();
+            log('Stage 2 done: mildew fraction=' + tissue.mildewFrac.toFixed(4));
+
+            setProgress(85, 'Stage 3: Classifying severity…');
+
+            // Stage 3: Severity
+            var cls = classify(tissue.mildewFrac);
+            var verdict = CLASSES[cls];
+            var pct = (tissue.mildewFrac * 100).toFixed(1);
+            var t3 = performance.now();
+
+            log('Stage 3 done: ' + verdict + ' (mildew ' + pct + '% of plant)');
+
+            // Render
+            setProgress(90, 'Rendering results…');
+            renderResults(img, origW, origH, s1.mask, tissue);
+
+            // Show verdict
+            var vBox = document.getElementById('verdictBox');
+            vBox.className = 'verdict-box ' + verdict;
+            document.getElementById('verdictLabel').innerText = verdict.toUpperCase();
+            document.getElementById('verdictDetail').innerText = 'Mildew covers ' + pct + '% of the plant area';
+
+            document.getElementById('resultInfo').innerHTML =
+              'Plant area: <b>' + (s1.areaFrac * 100).toFixed(1) + '%</b> of frame' +
+              '&nbsp;&nbsp;·&nbsp;&nbsp;Confidence: <b>' + (s1.conf * 100).toFixed(0) + '%</b>' +
+              '&nbsp;&nbsp;·&nbsp;&nbsp;Time: <b>' + ((t3 - t0) / 1000).toFixed(1) + 's</b>';
+
+            document.getElementById('resultWrap').style.display = 'block';
+            showWarnings(s1.warnings);
+            setProgress(100, 'Done');
+            setStatus('Done — ' + verdict);
+            setTimeout(function () { document.getElementById('progressWrap').style.display = 'none'; }, 1500);
+            resetBtn();
+          }).catch(function (err) {
+            console.error(err);
+            setStatus('Tissue segmentation failed: ' + err.message, true);
+            resetBtn();
+          });
+        });
+      }).catch(function (err) {
+        console.error(err);
+        setStatus('Plant segmentation failed: ' + err.message, true);
+        resetBtn();
+      });
+    };
+    img.onerror = function () {
+      setStatus('Could not load the image', true);
+      resetBtn();
+    };
+    img.src = URL.createObjectURL(selectedFile);
+  }
+
+  function resetBtn() {
+    var btn = document.getElementById('analyzeBtn');
+    btn.disabled = false;
+    btn.classList.add('active');
+    btn.innerText = 'Score Mildew';
+  }
+
+  function showWarnings(warns) {
+    if (warns.length === 0) return;
+    var ul = document.getElementById('warningsList');
+    ul.innerHTML = '';
+    warns.forEach(function (w) {
+      var li = document.createElement('li');
+      li.innerText = w;
+      ul.appendChild(li);
+    });
+    document.getElementById('warnings').style.display = 'block';
+  }
+
+  // ── Init ──
+  function init() {
+    var dropZone = document.getElementById('dropZone');
+    var selectBtn = document.getElementById('selectBtn');
+    var dropZoneSub = document.getElementById('dropZoneSub');
+    var previewWrap = document.getElementById('previewWrap');
+    var previewImg = document.getElementById('previewImg');
+    var changeBtn = document.getElementById('changeImageBtn');
+    var fileInput = document.getElementById('fileInput');
+    var analyzeBtn = document.getElementById('analyzeBtn');
+
+    selectBtn.addEventListener('click', function () { fileInput.click(); });
+    changeBtn.addEventListener('click', function () { fileInput.click(); });
+    dropZone.addEventListener('dragover', function (e) { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', function () { dropZone.classList.remove('dragover'); });
+    dropZone.addEventListener('drop', function (e) {
+      e.preventDefault(); dropZone.classList.remove('dragover');
+      if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', function () {
+      if (fileInput.files && fileInput.files[0]) handleFile(fileInput.files[0]);
+    });
+
+    function handleFile(file) {
+      selectedFile = file;
+      previewImg.src = URL.createObjectURL(file);
+      dropZone.querySelector('svg').style.display = 'none';
+      selectBtn.style.display = 'none';
+      dropZoneSub.style.display = 'none';
+      previewWrap.style.display = 'block';
+      document.getElementById('resultWrap').style.display = 'none';
+      document.getElementById('warnings').style.display = 'none';
+      if (modelsReady) {
+        analyzeBtn.disabled = false;
+        analyzeBtn.classList.add('active');
+        setStatus('Ready to score');
+      } else {
+        setStatus('Image selected — models still loading…');
+      }
+    }
+
+    analyzeBtn.addEventListener('click', function () {
+      if (!selectedFile || !modelsReady) return;
+      runPipeline();
+    });
+
+    // Load all models
+    var modelsLoaded = 0;
+    var totalModels = 4; // 1 plantseg + 3 tissue
+
+    function checkAllLoaded() {
+      modelsLoaded++;
+      setStatus('Loaded ' + modelsLoaded + ' of ' + totalModels + ' models…');
+      if (modelsLoaded === totalModels) {
+        modelsReady = true;
+        if (selectedFile) {
+          analyzeBtn.disabled = false;
+          analyzeBtn.classList.add('active');
+          setStatus('Ready to score');
+        } else {
+          setStatus('Models ready — select an image');
+        }
+      }
+    }
+
+    var opts = { executionProviders: ['wasm'] };
+
+    setStatus('Loading plantseg model…');
+    ort.InferenceSession.create('plantseg_v2.onnx', opts).then(function (s) {
+      plantSession = s;
+      log('plantseg loaded');
+      checkAllLoaded();
+    }).catch(function (err) {
+      setStatus('Failed to load plantseg: ' + err.message, true);
+    });
+
+    ['tissue_s1.onnx', 'tissue_s2.onnx', 'tissue_s3.onnx'].forEach(function (name, idx) {
+      ort.InferenceSession.create(name, opts).then(function (s) {
+        tissueModels[idx] = s;
+        log(name + ' loaded');
+        checkAllLoaded();
+      }).catch(function (err) {
+        setStatus('Failed to load ' + name + ': ' + err.message, true);
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>

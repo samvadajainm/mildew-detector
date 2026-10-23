@@ -1,0 +1,9 @@
+{
+  "version": "pipeline_2026-10-16",
+  "input_size": 512,
+  "long_edge": 2048,
+  "jpeg_quality": 95,
+  "cuts": {"t1": 0.03524000017205253, "t2": 0.2003050521016121},
+  "classes": ["healthy", "mild", "severe"],
+  "needs_review": {"pred_mildew_below": 0.02, "entropy_above": 0.42}
+}
