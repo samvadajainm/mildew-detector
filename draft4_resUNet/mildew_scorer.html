@@ -806,45 +806,55 @@
       runPipeline();
     });
 
-    // Load all models
-    var modelsLoaded = 0;
-    var totalModels = 4; // 1 plantseg + 3 tissue
+    // Load models sequentially to avoid WASM memory spikes
+    var opts = { executionProviders: ['wasm'] };
+    var modelQueue = [
+      { name: 'plantseg_v2.onnx', label: 'plantseg' },
+      { name: 'tissue_s1.onnx', label: 'tissue model 1' },
+      { name: 'tissue_s2.onnx', label: 'tissue model 2' },
+      { name: 'tissue_s3.onnx', label: 'tissue model 3' }
+    ];
+    var loadIdx = 0;
+    var loadErrors = [];
 
-    function checkAllLoaded() {
-      modelsLoaded++;
-      setStatus('Loaded ' + modelsLoaded + ' of ' + totalModels + ' models…');
-      if (modelsLoaded === totalModels) {
-        modelsReady = true;
-        if (selectedFile) {
-          analyzeBtn.disabled = false;
-          analyzeBtn.classList.add('active');
-          setStatus('Ready to score');
+    function loadNextModel() {
+      if (loadIdx >= modelQueue.length) {
+        if (loadErrors.length > 0) {
+          setStatus('Failed to load: ' + loadErrors.join(', '), true);
         } else {
-          setStatus('Models ready — select an image');
+          modelsReady = true;
+          if (selectedFile) {
+            analyzeBtn.disabled = false;
+            analyzeBtn.classList.add('active');
+            setStatus('Ready to score');
+          } else {
+            setStatus('Models ready — select an image');
+          }
         }
+        return;
       }
+      var item = modelQueue[loadIdx];
+      setStatus('Loading ' + item.label + ' (' + (loadIdx + 1) + ' of ' + modelQueue.length + ')…');
+      log('Loading ' + item.name + '…');
+
+      ort.InferenceSession.create(item.name, opts).then(function (s) {
+        if (loadIdx === 0) {
+          plantSession = s;
+        } else {
+          tissueModels[loadIdx - 1] = s;
+        }
+        log(item.name + ' loaded OK');
+        loadIdx++;
+        loadNextModel();
+      }).catch(function (err) {
+        log('FAILED ' + item.name + ': ' + err.message);
+        loadErrors.push(item.label + ' (' + err.message + ')');
+        loadIdx++;
+        loadNextModel();
+      });
     }
 
-    var opts = { executionProviders: ['wasm'] };
-
-    setStatus('Loading plantseg model…');
-    ort.InferenceSession.create('plantseg_v2.onnx', opts).then(function (s) {
-      plantSession = s;
-      log('plantseg loaded');
-      checkAllLoaded();
-    }).catch(function (err) {
-      setStatus('Failed to load plantseg: ' + err.message, true);
-    });
-
-    ['tissue_s1.onnx', 'tissue_s2.onnx', 'tissue_s3.onnx'].forEach(function (name, idx) {
-      ort.InferenceSession.create(name, opts).then(function (s) {
-        tissueModels[idx] = s;
-        log(name + ' loaded');
-        checkAllLoaded();
-      }).catch(function (err) {
-        setStatus('Failed to load ' + name + ': ' + err.message, true);
-      });
-    });
+    loadNextModel();
   }
 
   if (document.readyState === 'loading') {
