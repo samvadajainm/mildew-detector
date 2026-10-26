@@ -478,6 +478,20 @@
         var ty = ys[yi], tx = xs[xi];
         tileIdx++;
         completed++;
+
+        // Skip tiles with no plant pixels — result would be masked out anyway
+        var hasPlant = false;
+        for (var sy = ty; sy < Math.min(ty + tileSize, cropH) && !hasPlant; sy++) {
+          for (var sx = tx; sx < Math.min(tx + tileSize, cropW) && !hasPlant; sx++) {
+            if (plantMask[(minY + sy) * nw + (minX + sx)]) hasPlant = true;
+          }
+        }
+        if (!hasPlant) {
+          setProgress(20 + 60 * (completed / totalRuns), 'Tissue model ' + (modelIdx + 1) + '/3, tile ' + completed + '/' + totalRuns + ' (skip)');
+          setTimeout(nextTile, 0);
+          return;
+        }
+
         setProgress(20 + 60 * (completed / totalRuns), 'Tissue model ' + (modelIdx + 1) + '/3, tile ' + completed + '/' + totalRuns);
 
         // Build normalised CHW tensor for this tile
@@ -714,7 +728,10 @@
             document.getElementById('resultInfo').innerHTML =
               'Plant area: <b>' + (s1.areaFrac * 100).toFixed(1) + '%</b> of frame' +
               '&nbsp;&nbsp;·&nbsp;&nbsp;Confidence: <b>' + (s1.conf * 100).toFixed(0) + '%</b>' +
-              '&nbsp;&nbsp;·&nbsp;&nbsp;Time: <b>' + ((t3 - t0) / 1000).toFixed(1) + 's</b>';
+              '<br>Total: <b>' + ((t3 - t0) / 1000).toFixed(1) + 's</b>' +
+              '&nbsp;(seg ' + ((t1 - t0) / 1000).toFixed(1) + 's' +
+              ' + tissue ' + ((t2 - t1) / 1000).toFixed(1) + 's' +
+              ' + classify ' + ((t3 - t2) / 1000).toFixed(1) + 's)';
 
             document.getElementById('resultWrap').style.display = 'block';
             showWarnings(s1.warnings);
@@ -806,13 +823,14 @@
       runPipeline();
     });
 
-    // Load models sequentially to avoid WASM memory spikes
-    var opts = { executionProviders: ['wasm'] };
+    // Load models sequentially — fetch as ArrayBuffer first, then create session
+    // This avoids ONNX Runtime's opaque fetch and gives clear error messages.
+    var opts = { executionProviders: ['webgl', 'wasm'] };
     var modelQueue = [
-      { name: 'plantseg_v2.onnx', label: 'plantseg' },
-      { name: 'tissue_s1.onnx', label: 'tissue model 1' },
-      { name: 'tissue_s2.onnx', label: 'tissue model 2' },
-      { name: 'tissue_s3.onnx', label: 'tissue model 3' }
+      { name: 'plantseg_v2.onnx', label: 'plantseg', minMB: 10 },
+      { name: 'tissue_s1.onnx', label: 'tissue model 1', minMB: 10 },
+      { name: 'tissue_s2.onnx', label: 'tissue model 2', minMB: 10 },
+      { name: 'tissue_s3.onnx', label: 'tissue model 3', minMB: 10 }
     ];
     var loadIdx = 0;
     var loadErrors = [];
@@ -820,7 +838,7 @@
     function loadNextModel() {
       if (loadIdx >= modelQueue.length) {
         if (loadErrors.length > 0) {
-          setStatus('Failed to load: ' + loadErrors.join(', '), true);
+          setStatus('Failed to load: ' + loadErrors.join('; '), true);
         } else {
           modelsReady = true;
           if (selectedFile) {
@@ -835,9 +853,27 @@
       }
       var item = modelQueue[loadIdx];
       setStatus('Loading ' + item.label + ' (' + (loadIdx + 1) + ' of ' + modelQueue.length + ')…');
-      log('Loading ' + item.name + '…');
+      log('Fetching ' + item.name + '…');
 
-      ort.InferenceSession.create(item.name, opts).then(function (s) {
+      fetch(item.name).then(function (resp) {
+        if (!resp.ok) {
+          throw new Error('HTTP ' + resp.status + ' for ' + item.name);
+        }
+        var ct = resp.headers.get('content-type') || '';
+        log(item.name + ' content-type: ' + ct + ', status: ' + resp.status);
+        return resp.arrayBuffer();
+      }).then(function (buf) {
+        var sizeMB = buf.byteLength / (1024 * 1024);
+        log(item.name + ' fetched: ' + sizeMB.toFixed(1) + ' MB');
+        // Sanity check: if file is tiny, it's probably an LFS pointer or error page
+        if (sizeMB < item.minMB) {
+          // Try to read as text to show what we got
+          var snippet = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(200, buf.byteLength)));
+          throw new Error(item.name + ' is only ' + sizeMB.toFixed(1) + ' MB (expected 10+ MB). Got: ' + snippet.substring(0, 120));
+        }
+        setStatus('Creating session for ' + item.label + '…');
+        return ort.InferenceSession.create(buf, opts);
+      }).then(function (s) {
         if (loadIdx === 0) {
           plantSession = s;
         } else {
@@ -848,7 +884,7 @@
         loadNextModel();
       }).catch(function (err) {
         log('FAILED ' + item.name + ': ' + err.message);
-        loadErrors.push(item.label + ' (' + err.message + ')');
+        loadErrors.push(item.label + ': ' + err.message);
         loadIdx++;
         loadNextModel();
       });
