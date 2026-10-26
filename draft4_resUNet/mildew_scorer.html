@@ -190,9 +190,131 @@
 
   // Models
   var plantSession = null;
-  var tissueModels = [];  // array of 3 ONNX sessions
+  var tissueWorkers = [];   // 3 Web Workers, one per tissue model
+  var workersReady = 0;     // count of workers that finished init
   var modelsReady = false;
   var selectedFile = null;
+
+  // ── Web Worker code for parallel tissue inference ──
+  // Each worker loads one ONNX model and processes ALL tiles independently.
+  // 3 workers run in parallel → ~3× speedup for Stage 2.
+  function tissueWorkerCode() {
+    importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js');
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/';
+    ort.env.wasm.numThreads = 1; // parallelism comes from 3 workers, not WASM threads
+
+    var session = null;
+
+    self.onmessage = function (e) {
+      var msg = e.data;
+
+      // ── init: receive model ArrayBuffer, create ONNX session ──
+      if (msg.type === 'init') {
+        ort.InferenceSession.create(msg.buffer, { executionProviders: ['wasm'] })
+          .then(function (s) { session = s; self.postMessage({ type: 'ready' }); })
+          .catch(function (err) { self.postMessage({ type: 'error', message: err.message }); });
+        return;
+      }
+
+      // ── runAllTiles: process every tile for this model, return accumulated probs ──
+      if (msg.type === 'runAllTiles') {
+        var pH = msg.pH, pW = msg.pW, tileSize = msg.tileSize;
+        var mean = msg.mean, std = msg.std;
+        var paddedRGB = new Float32Array(msg.paddedRGB);
+        var plantMask = new Uint8Array(msg.plantMask);
+        var ys = msg.ys, xs = msg.xs;
+        var minX = msg.minX, minY = msg.minY;
+        var cropW = msg.cropW, cropH = msg.cropH, nw = msg.nw;
+
+        var accProbs = new Float32Array(3 * pH * pW);
+        var accCount = new Float32Array(pH * pW);
+        var totalTiles = ys.length * xs.length;
+        var completed = 0;
+
+        function processTile(idx) {
+          // Skip empty tiles in a loop (no stack growth)
+          while (idx < totalTiles) {
+            var yi = Math.floor(idx / xs.length);
+            var xi = idx % xs.length;
+            var ty = ys[yi], tx = xs[xi];
+            var hasPlant = false;
+            for (var sy = ty; sy < Math.min(ty + tileSize, cropH) && !hasPlant; sy++) {
+              for (var sx = tx; sx < Math.min(tx + tileSize, cropW) && !hasPlant; sx++) {
+                if (plantMask[(minY + sy) * nw + (minX + sx)]) hasPlant = true;
+              }
+            }
+            if (!hasPlant) { completed++; idx++; continue; }
+            break; // this tile needs inference
+          }
+
+          if (idx >= totalTiles) {
+            self.postMessage({ type: 'progress', completed: completed, total: totalTiles });
+            self.postMessage(
+              { type: 'done', accProbs: accProbs.buffer, accCount: accCount.buffer },
+              [accProbs.buffer, accCount.buffer]
+            );
+            return;
+          }
+
+          var yi = Math.floor(idx / xs.length);
+          var xi = idx % xs.length;
+          var ty = ys[yi], tx = xs[xi];
+
+          // Build normalised CHW tensor for this tile
+          var tileData = new Float32Array(3 * tileSize * tileSize);
+          for (var py = 0; py < tileSize; py++) {
+            for (var px = 0; px < tileSize; px++) {
+              var srcY = ty + py, srcX = tx + px;
+              var si = (srcY * pW + srcX) * 3;
+              var r = paddedRGB[si], g = paddedRGB[si + 1], b = paddedRGB[si + 2];
+              var ti = py * tileSize + px;
+              tileData[ti] = (r - mean[0]) / std[0];
+              tileData[tileSize * tileSize + ti] = (g - mean[1]) / std[1];
+              tileData[2 * tileSize * tileSize + ti] = (b - mean[2]) / std[2];
+            }
+          }
+
+          var tensor = new ort.Tensor('float32', tileData, [1, 3, tileSize, tileSize]);
+          session.run({ input: tensor }).then(function (res) {
+            var out = res.output.data;
+            // Softmax per pixel and accumulate
+            for (var py = 0; py < tileSize; py++) {
+              for (var px = 0; px < tileSize; px++) {
+                var gy = ty + py, gx = tx + px;
+                if (gy >= pH || gx >= pW) continue;
+                var c0 = out[0 * tileSize * tileSize + py * tileSize + px];
+                var c1 = out[1 * tileSize * tileSize + py * tileSize + px];
+                var c2 = out[2 * tileSize * tileSize + py * tileSize + px];
+                var maxC = Math.max(c0, c1, c2);
+                var e0 = Math.exp(c0 - maxC), e1 = Math.exp(c1 - maxC), e2 = Math.exp(c2 - maxC);
+                var sumE = e0 + e1 + e2;
+                var gi = gy * pW + gx;
+                accProbs[gi] += e0 / sumE;
+                accProbs[pH * pW + gi] += e1 / sumE;
+                accProbs[2 * pH * pW + gi] += e2 / sumE;
+                accCount[gi] += 1;
+              }
+            }
+            completed++;
+            self.postMessage({ type: 'progress', completed: completed, total: totalTiles });
+            processTile(idx + 1);
+          }).catch(function (err) {
+            self.postMessage({ type: 'error', message: err.message });
+          });
+        }
+
+        processTile(0);
+        return;
+      }
+    };
+  }
+
+  // Create blob URL for workers
+  var workerBlob = new Blob(
+    ['(' + tissueWorkerCode.toString() + ')()'],
+    { type: 'application/javascript' }
+  );
+  var workerUrl = URL.createObjectURL(workerBlob);
 
   function log(msg) { console.log('[mildewscore] ' + msg); }
   function setStatus(msg, isError) {
@@ -336,7 +458,7 @@
     });
   }
 
-  // ── Stage 2: ResUNet tissue segmentation (tiled, 3-model ensemble) ──
+  // ── Stage 2: ResUNet tissue segmentation (parallel 3-model ensemble via Web Workers) ──
   function runTissueSeg(normCanvas, nw, nh, plantMaskOrig, origW, origH) {
     return new Promise(function (resolve, reject) {
       // Get normalised image pixels (RGB)
@@ -417,124 +539,105 @@
       if (xs.length === 0) xs.push(0);
 
       var totalTiles = ys.length * xs.length;
-      var totalRuns = totalTiles * tissueModels.length;
-      var completed = 0;
+      log('Stage 2: ' + totalTiles + ' tiles × 3 models (parallel workers)');
 
-      // Accumulator for averaged softmax probabilities: 3 classes x pH x pW
-      var accProbs = new Float32Array(3 * pH * pW);
-      var accCount = new Float32Array(pH * pW);
+      // ── Dispatch to 3 workers in parallel ──
+      var workersDone = 0;
+      var workerResults = [null, null, null]; // { accProbs: ArrayBuffer, accCount: ArrayBuffer }
+      var workerProgress = [0, 0, 0];
+      var errored = false;
 
-      // Process tiles sequentially (async)
-      var modelIdx = 0;
-      var tileIdx = 0;
+      function onWorkerMessage(wIdx, e) {
+        if (errored) return;
+        var msg = e.data;
 
-      function nextTile() {
-        if (modelIdx >= tissueModels.length) {
-          // All models done. Average probabilities.
-          for (var i = 0; i < pH * pW; i++) {
-            var cnt = accCount[i] || 1;
-            accProbs[i] /= cnt;
-            accProbs[pH * pW + i] /= cnt;
-            accProbs[2 * pH * pW + i] /= cnt;
-          }
+        if (msg.type === 'progress') {
+          workerProgress[wIdx] = msg.completed;
+          var sum = workerProgress[0] + workerProgress[1] + workerProgress[2];
+          var totalAll = totalTiles * 3;
+          setProgress(20 + 60 * (sum / totalAll),
+            'Tissue models (3 parallel), tiles ' + sum + '/' + totalAll);
+        }
 
-          // Argmax → mildew mask (class 1 = mildew)
-          var mildewMask = new Uint8Array(nw * nh);
-          var insidePlant = 0, mildewPixels = 0;
-          for (var cy = 0; cy < cropH; cy++) {
-            for (var cx = 0; cx < cropW; cx++) {
-              var sx = minX + cx, sy = minY + cy;
-              if (!plantMask[sy * nw + sx]) continue;
-              // Check if pixel has non-zero colour (inside crop)
-              var ri = (cy * cropW + cx) * 3;
-              if (cropRGB[ri] === 0 && cropRGB[ri + 1] === 0 && cropRGB[ri + 2] === 0 && !plantMask[sy * nw + sx]) continue;
-              insidePlant++;
-              var pi = cy * pW + cx;
-              var p0 = accProbs[pi];
-              var p1 = accProbs[pH * pW + pi];
-              var p2 = accProbs[2 * pH * pW + pi];
-              if (p1 >= p0 && p1 >= p2) {
-                mildewMask[sy * nw + sx] = 1;
-                mildewPixels++;
+        if (msg.type === 'done') {
+          workerResults[wIdx] = { accProbs: msg.accProbs, accCount: msg.accCount };
+          workersDone++;
+          log('Worker ' + wIdx + ' done (' + workersDone + '/3)');
+
+          if (workersDone === 3) {
+            // Merge results from all 3 workers
+            var mergedProbs = new Float32Array(3 * pH * pW);
+            var mergedCount = new Float32Array(pH * pW);
+            for (var w = 0; w < 3; w++) {
+              var wp = new Float32Array(workerResults[w].accProbs);
+              var wc = new Float32Array(workerResults[w].accCount);
+              for (var i = 0; i < 3 * pH * pW; i++) mergedProbs[i] += wp[i];
+              for (var i = 0; i < pH * pW; i++) mergedCount[i] += wc[i];
+            }
+
+            // Average probabilities
+            for (var i = 0; i < pH * pW; i++) {
+              var cnt = mergedCount[i] || 1;
+              mergedProbs[i] /= cnt;
+              mergedProbs[pH * pW + i] /= cnt;
+              mergedProbs[2 * pH * pW + i] /= cnt;
+            }
+
+            // Argmax → mildew mask (class 1 = mildew)
+            var mildewMask = new Uint8Array(nw * nh);
+            var insidePlant = 0, mildewPixels = 0;
+            for (var cy = 0; cy < cropH; cy++) {
+              for (var cx = 0; cx < cropW; cx++) {
+                var sx = minX + cx, sy = minY + cy;
+                if (!plantMask[sy * nw + sx]) continue;
+                var ri = (cy * cropW + cx) * 3;
+                if (cropRGB[ri] === 0 && cropRGB[ri + 1] === 0 && cropRGB[ri + 2] === 0 && !plantMask[sy * nw + sx]) continue;
+                insidePlant++;
+                var pi = cy * pW + cx;
+                var p0 = mergedProbs[pi];
+                var p1 = mergedProbs[pH * pW + pi];
+                var p2 = mergedProbs[2 * pH * pW + pi];
+                if (p1 >= p0 && p1 >= p2) {
+                  mildewMask[sy * nw + sx] = 1;
+                  mildewPixels++;
+                }
               }
             }
-          }
 
-          var frac = insidePlant > 0 ? mildewPixels / insidePlant : 0;
-          resolve({ mildewMask: mildewMask, mildewFrac: frac, insidePlant: insidePlant, mildewPixels: mildewPixels, normW: nw, normH: nh, scaleX: scaleX, scaleY: scaleY });
-          return;
-        }
-
-        var yi = Math.floor(tileIdx / xs.length);
-        var xi = tileIdx % xs.length;
-        if (yi >= ys.length) {
-          // Move to next model
-          modelIdx++;
-          tileIdx = 0;
-          setTimeout(nextTile, 0);
-          return;
-        }
-
-        var ty = ys[yi], tx = xs[xi];
-        tileIdx++;
-        completed++;
-
-        // Skip tiles with no plant pixels — result would be masked out anyway
-        var hasPlant = false;
-        for (var sy = ty; sy < Math.min(ty + tileSize, cropH) && !hasPlant; sy++) {
-          for (var sx = tx; sx < Math.min(tx + tileSize, cropW) && !hasPlant; sx++) {
-            if (plantMask[(minY + sy) * nw + (minX + sx)]) hasPlant = true;
-          }
-        }
-        if (!hasPlant) {
-          setProgress(20 + 60 * (completed / totalRuns), 'Tissue model ' + (modelIdx + 1) + '/3, tile ' + completed + '/' + totalRuns + ' (skip)');
-          setTimeout(nextTile, 0);
-          return;
-        }
-
-        setProgress(20 + 60 * (completed / totalRuns), 'Tissue model ' + (modelIdx + 1) + '/3, tile ' + completed + '/' + totalRuns);
-
-        // Build normalised CHW tensor for this tile
-        var tileData = new Float32Array(3 * tileSize * tileSize);
-        for (var py = 0; py < tileSize; py++) {
-          for (var px = 0; px < tileSize; px++) {
-            var srcY = ty + py, srcX = tx + px;
-            var si = (srcY * pW + srcX) * 3;
-            var r = paddedRGB[si], g = paddedRGB[si + 1], b = paddedRGB[si + 2];
-            var ti = py * tileSize + px;
-            tileData[ti] = (r - MEAN[0]) / STD[0];
-            tileData[tileSize * tileSize + ti] = (g - MEAN[1]) / STD[1];
-            tileData[2 * tileSize * tileSize + ti] = (b - MEAN[2]) / STD[2];
+            var frac = insidePlant > 0 ? mildewPixels / insidePlant : 0;
+            resolve({ mildewMask: mildewMask, mildewFrac: frac, insidePlant: insidePlant, mildewPixels: mildewPixels, normW: nw, normH: nh, scaleX: scaleX, scaleY: scaleY });
           }
         }
 
-        var tensor = new ort.Tensor('float32', tileData, [1, 3, tileSize, tileSize]);
-        tissueModels[modelIdx].run({ input: tensor }).then(function (res) {
-          var out = res.output.data; // [1, 3, 512, 512]
-          // Softmax per pixel and accumulate
-          for (var py = 0; py < tileSize; py++) {
-            for (var px = 0; px < tileSize; px++) {
-              var gy = ty + py, gx = tx + px;
-              if (gy >= pH || gx >= pW) continue;
-              var c0 = out[0 * tileSize * tileSize + py * tileSize + px];
-              var c1 = out[1 * tileSize * tileSize + py * tileSize + px];
-              var c2 = out[2 * tileSize * tileSize + py * tileSize + px];
-              // Softmax
-              var maxC = Math.max(c0, c1, c2);
-              var e0 = Math.exp(c0 - maxC), e1 = Math.exp(c1 - maxC), e2 = Math.exp(c2 - maxC);
-              var sumE = e0 + e1 + e2;
-              var gi = gy * pW + gx;
-              accProbs[gi] += e0 / sumE;
-              accProbs[pH * pW + gi] += e1 / sumE;
-              accProbs[2 * pH * pW + gi] += e2 / sumE;
-              accCount[gi] += 1;
-            }
-          }
-          setTimeout(nextTile, 0);
-        }).catch(reject);
+        if (msg.type === 'error') {
+          errored = true;
+          reject(new Error('Tissue worker ' + (wIdx + 1) + ': ' + msg.message));
+        }
       }
 
-      nextTile();
+      // Set up message handlers for this run
+      for (var w = 0; w < 3; w++) {
+        (function (idx) {
+          tissueWorkers[idx].onmessage = function (e) { onWorkerMessage(idx, e); };
+        })(w);
+      }
+
+      // Send tile work to all 3 workers simultaneously
+      // Each worker gets a COPY of paddedRGB and plantMask (transferred for zero-copy)
+      for (var w = 0; w < 3; w++) {
+        var prgbCopy = paddedRGB.buffer.slice(0);
+        var pmaskCopy = plantMask.buffer.slice(0);
+        tissueWorkers[w].postMessage({
+          type: 'runAllTiles',
+          paddedRGB: prgbCopy,
+          plantMask: pmaskCopy,
+          pH: pH, pW: pW, tileSize: tileSize,
+          mean: MEAN, std: STD,
+          ys: ys, xs: xs,
+          minX: minX, minY: minY,
+          cropW: cropW, cropH: cropH, nw: nw
+        }, [prgbCopy, pmaskCopy]);
+      }
     });
   }
 
@@ -698,9 +801,9 @@
 
         // Stage 1b: Normalise
         normaliseImage(img, origW, origH).then(function (norm) {
-          setProgress(20, 'Stage 2: Tissue segmentation (this takes a while)…');
+          setProgress(20, 'Stage 2: Tissue segmentation (3 models in parallel)…');
 
-          // Stage 2: ResUNet tissue segmentation
+          // Stage 2: ResUNet tissue segmentation (parallel workers)
           runTissueSeg(norm.canvas, norm.width, norm.height, s1.mask, origW, origH).then(function (tissue) {
             var t2 = performance.now();
             log('Stage 2 done: mildew fraction=' + tissue.mildewFrac.toFixed(4));
@@ -823,32 +926,63 @@
       runPipeline();
     });
 
-    // Load models sequentially — fetch as ArrayBuffer first, then create session
-    // This avoids ONNX Runtime's opaque fetch and gives clear error messages.
-    var wasmOpts = { executionProviders: ['wasm'] };
-    var gpuOpts  = { executionProviders: ['webgl', 'wasm'] };
+    // ── Model loading ──
+    // plantseg: loaded on main thread (WASM with multi-threading)
+    // tissue models 1-3: each loaded in its own Web Worker (parallel inference)
+    ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+    var opts = { executionProviders: ['wasm'] };
+
     var modelQueue = [
-      { name: 'plantseg_v2.onnx', label: 'plantseg', minMB: 10, opts: wasmOpts },
-      { name: 'tissue_s1.onnx', label: 'tissue model 1', minMB: 10, opts: gpuOpts },
-      { name: 'tissue_s2.onnx', label: 'tissue model 2', minMB: 10, opts: gpuOpts },
-      { name: 'tissue_s3.onnx', label: 'tissue model 3', minMB: 10, opts: gpuOpts }
+      { name: 'plantseg_v2.onnx', label: 'plantseg', minMB: 10, isPlant: true },
+      { name: 'tissue_s1.onnx', label: 'tissue model 1', minMB: 10, workerIdx: 0 },
+      { name: 'tissue_s2.onnx', label: 'tissue model 2', minMB: 10, workerIdx: 1 },
+      { name: 'tissue_s3.onnx', label: 'tissue model 3', minMB: 10, workerIdx: 2 }
     ];
     var loadIdx = 0;
     var loadErrors = [];
+    var plantLoaded = false;
+
+    // Create 3 workers
+    for (var i = 0; i < 3; i++) {
+      tissueWorkers.push(new Worker(workerUrl));
+    }
+
+    function checkAllReady() {
+      if (plantLoaded && workersReady === 3 && loadErrors.length === 0) {
+        modelsReady = true;
+        log('All models ready (plantseg on main thread, 3 tissue workers)');
+        if (selectedFile) {
+          analyzeBtn.disabled = false;
+          analyzeBtn.classList.add('active');
+          setStatus('Ready to score');
+        } else {
+          setStatus('Models ready — select an image');
+        }
+      }
+    }
+
+    // Worker ready handlers
+    for (var i = 0; i < 3; i++) {
+      (function (idx) {
+        tissueWorkers[idx].onmessage = function (e) {
+          if (e.data.type === 'ready') {
+            workersReady++;
+            log('Tissue worker ' + (idx + 1) + ' ready (' + workersReady + '/3)');
+            checkAllReady();
+          }
+          if (e.data.type === 'error') {
+            log('Tissue worker ' + (idx + 1) + ' init error: ' + e.data.message);
+            loadErrors.push('tissue model ' + (idx + 1) + ': ' + e.data.message);
+            setStatus('Failed to load: ' + loadErrors.join('; '), true);
+          }
+        };
+      })(i);
+    }
 
     function loadNextModel() {
       if (loadIdx >= modelQueue.length) {
         if (loadErrors.length > 0) {
           setStatus('Failed to load: ' + loadErrors.join('; '), true);
-        } else {
-          modelsReady = true;
-          if (selectedFile) {
-            analyzeBtn.disabled = false;
-            analyzeBtn.classList.add('active');
-            setStatus('Ready to score');
-          } else {
-            setStatus('Models ready — select an image');
-          }
         }
         return;
       }
@@ -866,21 +1000,29 @@
       }).then(function (buf) {
         var sizeMB = buf.byteLength / (1024 * 1024);
         log(item.name + ' fetched: ' + sizeMB.toFixed(1) + ' MB');
-        // Sanity check: if file is tiny, it's probably an LFS pointer or error page
         if (sizeMB < item.minMB) {
-          // Try to read as text to show what we got
           var snippet = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(200, buf.byteLength)));
           throw new Error(item.name + ' is only ' + sizeMB.toFixed(1) + ' MB (expected 10+ MB). Got: ' + snippet.substring(0, 120));
         }
-        setStatus('Creating session for ' + item.label + '…');
-        return ort.InferenceSession.create(buf, item.opts);
-      }).then(function (s) {
-        if (loadIdx === 0) {
-          plantSession = s;
+
+        if (item.isPlant) {
+          // plantseg: create session on main thread
+          setStatus('Creating session for ' + item.label + '…');
+          return ort.InferenceSession.create(buf, opts).then(function (s) {
+            plantSession = s;
+            plantLoaded = true;
+            log('plantseg loaded on main thread');
+            checkAllReady();
+          });
         } else {
-          tissueModels[loadIdx - 1] = s;
+          // tissue model: transfer buffer to worker (zero-copy)
+          setStatus('Initialising ' + item.label + ' in worker…');
+          tissueWorkers[item.workerIdx].postMessage(
+            { type: 'init', buffer: buf },
+            [buf]
+          );
         }
-        log(item.name + ' loaded OK');
+      }).then(function () {
         loadIdx++;
         loadNextModel();
       }).catch(function (err) {
