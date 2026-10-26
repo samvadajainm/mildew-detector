@@ -825,14 +825,13 @@
 
     // Load models sequentially — fetch as ArrayBuffer first, then create session
     // This avoids ONNX Runtime's opaque fetch and gives clear error messages.
-    // Enable WASM multi-threading for faster inference
-    ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
-    var opts = { executionProviders: ['wasm'] };
+    var wasmOpts = { executionProviders: ['wasm'] };
+    var gpuOpts  = { executionProviders: ['webgl', 'wasm'] };
     var modelQueue = [
-      { name: 'plantseg_v2.onnx', label: 'plantseg', minMB: 10 },
-      { name: 'tissue_s1.onnx', label: 'tissue model 1', minMB: 10 },
-      { name: 'tissue_s2.onnx', label: 'tissue model 2', minMB: 10 },
-      { name: 'tissue_s3.onnx', label: 'tissue model 3', minMB: 10 }
+      { name: 'plantseg_v2.onnx', label: 'plantseg', minMB: 10, opts: wasmOpts },
+      { name: 'tissue_s1.onnx', label: 'tissue model 1', minMB: 10, opts: gpuOpts },
+      { name: 'tissue_s2.onnx', label: 'tissue model 2', minMB: 10, opts: gpuOpts },
+      { name: 'tissue_s3.onnx', label: 'tissue model 3', minMB: 10, opts: gpuOpts }
     ];
     var loadIdx = 0;
     var loadErrors = [];
@@ -874,7 +873,7 @@
           throw new Error(item.name + ' is only ' + sizeMB.toFixed(1) + ' MB (expected 10+ MB). Got: ' + snippet.substring(0, 120));
         }
         setStatus('Creating session for ' + item.label + '…');
-        return ort.InferenceSession.create(buf, opts);
+        return ort.InferenceSession.create(buf, item.opts);
       }).then(function (s) {
         if (loadIdx === 0) {
           plantSession = s;
